@@ -4,6 +4,10 @@ on:
   pull_request:
     paths:
       - ".github/workflows/es-policy26-readonly-audit.yml"
+      - "AGENTS.md"
+      - ".engineering/**"
+      - "tools/**"
+      - ".github/workflows/engineering-system.yml"
 
 permissions:
   contents: read
