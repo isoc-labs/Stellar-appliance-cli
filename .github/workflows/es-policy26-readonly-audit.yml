@@ -28,6 +28,7 @@ jobs:
         with:
           repository: datarelay-labs/engineering-system
           ref: 141bd3fcad6f95d3a382e91fdc351ae0a54819a4
+          fetch-depth: 0
           persist-credentials: false
           path: canonical
       - name: Set up Python
@@ -39,6 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git -C canonical rev-parse HEAD)" = "141bd3fcad6f95d3a382e91fdc351ae0a54819a4"
+          git -C canonical cat-file -e "2c73cdd52b98db4143b379730ee0c69d284f80e8:tools/user_acceptance_contract.py"
           test "$(git -C target rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
           python3 -m pip install --disable-pip-version-check -r canonical/.engineering/requirements-engineering-system.txt
       - name: Audit managed upgrade without target source writes
