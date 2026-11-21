@@ -79,3 +79,48 @@ jobs:
             --root "$scratch" --require-current-policy
           test -z "$(git -C target status --porcelain)"
           echo "PRODUCTION_SOURCE_UNMODIFIED=YES"
+      - name: Emit strictly allowlisted sandbox-only managed patch for review
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import os
+          import subprocess
+          from pathlib import Path
+          target = Path("target")
+          scratch = Path(os.environ["RUNNER_TEMP"]) / "es-policy-upgrade-sandbox"
+          expected = {
+              ".engineering/governance-migration.yaml",
+              ".engineering/project.yaml",
+              ".github/workflows/engineering-release.yml",
+              ".github/workflows/engineering-system.yml",
+              "schemas/user-acceptance-evidence.schema.json",
+              "tools/coordinator.py",
+              "tools/coordinator_watch_effects.py",
+              "tools/governance_floor.py",
+              "tools/handoff_contract.py",
+              "tools/terminal_completion_notify.py",
+              "tools/user_acceptance_contract.py",
+              "tools/work_admission.py",
+          }
+          def git(path, *args):
+              return subprocess.check_output(
+                  ["git", "-C", str(path), *args], text=True).strip()
+          head = git(target, "rev-parse", "HEAD")
+          assert head == git(scratch, "rev-parse", "HEAD")
+          changed = set(git(scratch, "diff", "--name-only").splitlines())
+          assert changed == expected, (changed - expected, expected - changed)
+          tree = git(target, "rev-parse", "HEAD^{tree}")
+          print("MANAGED_PATCH_BEGIN " + head + " " + tree)
+          for rel in sorted(changed):
+              path = scratch / rel
+              assert path.is_file() and not path.is_symlink()
+              raw = path.read_bytes()
+              assert 0 < len(raw) < 150000
+              raw.decode("utf-8")
+              print("MANAGED_FILE " + rel + " " + hashlib.sha256(raw).hexdigest()
+                    + " " + base64.b64encode(raw).decode("ascii"))
+          print("MANAGED_PATCH_END")
+          PY
