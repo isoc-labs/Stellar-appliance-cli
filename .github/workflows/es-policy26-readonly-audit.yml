@@ -1,4 +1,4 @@
-name: Engineering System policy 26 read-only adoption audit
+name: Engineering System policy 26 isolated adoption qualification
 
 on:
   pull_request:
@@ -52,3 +52,24 @@ jobs:
           echo "SOURCE_UNMODIFIED=YES"
           echo "TARGET_HEAD=$(git -C target rev-parse HEAD)"
           echo "CANONICAL_HEAD=$(git -C canonical rev-parse HEAD)"
+
+      - name: Apply canonical managed upgrade only inside disposable sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/es-policy-upgrade-sandbox"
+          cp -a target "$scratch"
+          test "$(git -C "$scratch" rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          python3 -B canonical/tools/upgrade-adoption.py \
+            --root "$scratch" \
+            --apply \
+            --baseline-sha 141bd3fcad6f95d3a382e91fdc351ae0a54819a4
+          git -C "$scratch" diff --check
+          git -C "$scratch" diff --stat
+          echo "UPGRADED_FILES_BEGIN"
+          git -C "$scratch" status --short
+          echo "UPGRADED_FILES_END"
+          python3 -B canonical/tools/check-adoption.py \
+            --root "$scratch" --require-current-policy
+          test -z "$(git -C target status --porcelain)"
+          echo "PRODUCTION_SOURCE_UNMODIFIED=YES"
