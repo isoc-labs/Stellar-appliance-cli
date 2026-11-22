@@ -1,7 +1,7 @@
 contract_version: 2
 from_governance_epoch: 0
 to_governance_epoch: 1
-base_sha: eeb188e9e896bfe596487c7e0dd6a2282bd27afd
+base_sha: 48cdfc006a7380a69b8dbd53c31a72e382533d04
 requires_exact_head_validate: true
 automation_eligible: false
 rationale: Managed adoption upgrade 2c73cdd52b98db4143b379730ee0c69d284f80e8 -> 141bd3fcad6f95d3a382e91fdc351ae0a54819a4
