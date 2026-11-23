@@ -32,7 +32,7 @@ The CLI is an operations layer. It does not replace the OpenXDR KVM Installer fo
 ## Installation
 
 ```bash
-git clone https://github.com/xdr-labs/Stellar-appliance-cli.git
+git clone https://github.com/isoc-labs/Stellar-appliance-cli.git
 cd Stellar-appliance-cli
 
 python3 -m venv venv
@@ -206,12 +206,12 @@ Available VM names depend on the deployed appliance topology.
 
 The maintained operator guide is published with the OpenXDR KVM Installer documentation:
 
-**https://kvm.xdr.ooo/operations/appliance-cli**
+**https://kvm.isoc.ooo/operations/appliance-cli**
 
 Related projects:
 
-- OpenXDR KVM Installer: https://github.com/xdr-labs/OpenXDR-KVM-Installer
-- XDR Labs portal: https://xdr.ooo/
+- OpenXDR KVM Installer: https://github.com/isoc-labs/OpenXDR-KVM-Installer
+- XDR Labs portal: https://isoc.ooo/
 
 ## License
 
