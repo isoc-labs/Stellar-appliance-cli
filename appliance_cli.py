@@ -34,7 +34,9 @@ import signal
 import subprocess
 import shutil
 import struct
-import hashlib
+import ctypes
+import ctypes.util
+import hmac
 import logging
 import logging.handlers
 import ipaddress
@@ -49,6 +51,47 @@ NETWORK_INTERFACES_DIR = "/etc/network/interfaces.d"
 NTPSEC_CONFIG_PATH = "/etc/ntpsec/ntp.conf"
 NTPSEC_SERVICE = "ntpsec"
 NTPSEC_QUERY_COMMAND = ["ntpq", "-pn"]
+
+
+def _verify_system_account_password(username, password, shadow_path="/etc/shadow"):
+    """Verify a password against the invoking Unix account's shadow hash."""
+    if not username or not password or "\x00" in username or "\x00" in password:
+        return False
+
+    try:
+        pwd.getpwnam(username)
+        stored_hash = None
+        with open(shadow_path, "r", encoding="utf-8") as shadow_file:
+            for entry in shadow_file:
+                fields = entry.rstrip("\n").split(":")
+                if len(fields) > 1 and fields[0] == username:
+                    stored_hash = fields[1]
+                    break
+    except (OSError, KeyError, UnicodeError):
+        return False
+
+    # Locked or unset account passwords must not authorize a root shell.
+    if not stored_hash or stored_hash.startswith(("!", "*")):
+        return False
+
+    library_name = ctypes.util.find_library("crypt")
+    if not library_name:
+        return False
+
+    try:
+        libcrypt = ctypes.CDLL(library_name)
+        crypt_function = libcrypt.crypt
+        crypt_function.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        crypt_function.restype = ctypes.c_char_p
+        candidate = crypt_function(
+            password.encode("utf-8"), stored_hash.encode("utf-8")
+        )
+        if not candidate:
+            return False
+        candidate_hash = candidate.decode("utf-8")
+        return hmac.compare_digest(candidate_hash, stored_hash)
+    except (AttributeError, OSError, UnicodeError, ValueError):
+        return False
 
 
 class _AtomicCommitError(Exception):
@@ -489,7 +532,6 @@ class AellaCli(cmd.Cmd, object):
         self.shell_command = [
             'ping', 'tcpdump', 'traceroute', 'ifconfig', 'iptables', 'dmesg', 'ip', 'dig', 'htop', 'top'
         ]
-        self.shell_pass = '0238b57cd42b4aa6b85991ea28702133'
 
     # Main loop
     def cmdloop(self, intro=None):
@@ -537,8 +579,21 @@ class AellaCli(cmd.Cmd, object):
         return [k for k in keys if k.startswith(text)]
 
     def is_password_valid(self):
-        passcode = getpass.getpass('')
-        return passcode and hashlib.md5(passcode.encode('utf-8')).hexdigest() == self.shell_pass
+        passcode = getpass.getpass('Password: ')
+        if not passcode or os.geteuid() != 0:
+            return False
+
+        username = os.environ.get("SUDO_USER")
+        if not username:
+            try:
+                username = pwd.getpwuid(os.getuid()).pw_name
+            except KeyError:
+                return False
+
+        # A user already running the CLI as root does not need an additional gate.
+        if username == "root":
+            return True
+        return _verify_system_account_password(username, passcode)
 
     @staticmethod
     def _on_nested_command(line, help_meta, callback_meta):
@@ -644,31 +699,130 @@ class AellaCli(cmd.Cmd, object):
                 print('')
 
     # Shell command
+    def _is_safe_shell_diagnostic(self, tokens):
+        """Allow diagnostic commands without exposing root command execution."""
+        if not tokens:
+            return False
+        command, args = tokens[0], tokens[1:]
+
+        if command == "ip":
+            # ip netns exec launches an arbitrary program with the CLI's root
+            # privileges. Only read-only address/link/route/neighbour queries
+            # are available without the authenticated maintenance shell.
+            allowed_flags = {
+                "-4", "-6", "-br", "-brief", "-s", "-stats", "-d",
+                "-details", "-o", "-oneline", "-r", "-resolve", "-numeric",
+                "-j", "-json",
+            }
+            index = 0
+            while index < len(args) and args[index].startswith("-"):
+                flag = args[index]
+                if flag in allowed_flags:
+                    index += 1
+                elif flag == "-family" and index + 1 < len(args) and args[index + 1] in {"inet", "inet6", "link"}:
+                    index += 2
+                else:
+                    return False
+            if index >= len(args):
+                return True
+            object_name = args[index]
+            remaining = args[index + 1:]
+            if object_name == "netns":
+                return remaining == ["list"]
+            if object_name not in {"addr", "address", "link", "route", "neigh", "neighbor", "rule"}:
+                return False
+            if not remaining:
+                return True
+            if remaining[0] in {"show", "list"}:
+                return True
+            return object_name == "route" and remaining[0] == "get"
+
+        if command == "tcpdump":
+            # tcpdump -z executes a post-rotation command as the CLI user;
+            # -w can overwrite arbitrary files because this CLI runs as root.
+            return not any(
+                token in {"-z", "-w", "--postrotate-command", "--write"}
+                or token.startswith("-z") or token.startswith("-w")
+                for token in args
+            )
+
+        if command == "dmesg":
+            # Keep kernel-log inspection, but do not let the diagnostic path
+            # clear the ring buffer or alter console logging policy.
+            return not any(
+                token in {"-c", "--read-clear", "-C", "--clear", "-n", "--console-level"}
+                or token.startswith("--console-level=")
+                for token in args
+            )
+
+        if command == "iptables":
+            # Raw firewall changes bypass the staged ACL workflow. Keep only
+            # list/rule-inspection operations on the unauthenticated path.
+            tables = {"filter", "nat", "mangle", "raw", "security"}
+            read_only_flags = {
+                "-n", "--numeric", "-v", "--verbose", "-x", "--exact",
+                "--line-numbers", "-w",
+            }
+            index = 0
+            while index < len(args):
+                token = args[index]
+                if token == "-t" and index + 1 < len(args) and args[index + 1] in tables:
+                    index += 2
+                elif token in read_only_flags:
+                    index += 1
+                else:
+                    break
+            if index >= len(args) or args[index] not in {"-L", "--list", "-S", "--list-rules"}:
+                return False
+            for token in args[index + 1:]:
+                if token in read_only_flags:
+                    continue
+                if token.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", token):
+                    return False
+            return True
+
+        if command == "ifconfig":
+            # ifconfig with no argument or one interface is read-only; options
+            # such as up/down/netmask can change host networking.
+            return len(args) <= 1 and (
+                not args or args == ["-a"] or
+                re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", args[0]) is not None
+            )
+
+        if command == "top":
+            # Interactive top supports a shell-command escape. Batch mode does not.
+            return "-b" in args
+
+        return True
+
     @log_cmd
     def do_shell(self, line):
         """Shell command"""
-        key = ''
-        passcode = ''
-        if line:
-            key = line.split()[0]
+        try:
+            tokens = shlex.split(line) if line else []
+        except ValueError as exc:
+            print("Invalid diagnostic command: {}".format(exc))
+            return
 
+        key = tokens[0] if tokens else ""
         if not key:
             if self.is_password_valid():
-                subprocess.call("/usr/bin/sudo bash -lc 'cd /root && exec bash'", shell=True)
-        elif key in self.shell_command:
-            # Prevent displaying aella_cli content
-            if line.find('cli') >= 0:
-                return
-            elif key == 'tcpdump' or key == 'iptables':
-                line = 'sudo ' + line
+                subprocess.call(["/usr/bin/sudo", "bash", "-lc", "cd /root && exec bash"])
             else:
-                line = line
-
-            tokens = line.split()
+                print("Authentication failed. Use 'set password' to set your account password.")
+        elif key in self.shell_command:
+            # Prevent displaying aella_cli content.
+            if "cli" in line:
+                return
+            if not self._is_safe_shell_diagnostic(tokens):
+                print("Command is restricted on the unauthenticated diagnostic path. Use 'shell' for maintenance access.")
+                return
+            if key in {"tcpdump", "iptables"}:
+                tokens.insert(0, "sudo")
             try:
                 subprocess.call(tokens, shell=False)
-            except Exception as e:
-                print("Command failed {}".format(e))
+            except Exception as exc:
+                print("Command failed {}".format(exc))
 
     @staticmethod
     def show_cmd_default_callback(key, param):
@@ -1494,8 +1648,30 @@ class AellaCli(cmd.Cmd, object):
         if len(param) > 0:
             print('\nset password <Enter>\t Press enter to input password and ctrl-D to abort\n')
             return
-        subprocess.call("/usr/bin/passwd `awk -F: '{print $1}' /etc/passwd | grep -E '^(aella|stellar)$' | head -n 1`",
-                        shell=True)
+
+        invoking_user = os.environ.get("SUDO_USER", "")
+        if invoking_user in {"aella", "stellar"}:
+            try:
+                pwd.getpwnam(invoking_user)
+                username = invoking_user
+            except KeyError:
+                username = ""
+        else:
+            username = ""
+
+        if not username:
+            for candidate in ("aella", "stellar"):
+                try:
+                    pwd.getpwnam(candidate)
+                    username = candidate
+                    break
+                except KeyError:
+                    continue
+
+        if not username:
+            print("No supported appliance account (aella/stellar) was found.")
+            return
+        subprocess.call(["/usr/bin/passwd", username])
 
     def set_tz_callback(self, key, param):
         timezones = self._list_timezones()
@@ -1571,20 +1747,32 @@ class AellaCli(cmd.Cmd, object):
         return
 
     def set_time_callback(self, key, param):
-        if not param or param[0].endswith('?') or len(param) < 2:
+        if not param or len(param) != 2 or param[0].endswith('?') or param[1].endswith('?'):
             print('\n<YYYY-MM-DD HH:MM:SS> \t Specify system date and time\n')
             return
 
-        date = param[0]
-        time = param[1]
-        if len(date.split('-')) < 3:
+        date, time = param
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
             print('Wrong date format:', date)
             return
-        if len(time.split(':')) < 3:
+        if not re.fullmatch(r"\d{2}:\d{2}:\d{2}", time):
             print('Wrong time format:', time)
             return
+        try:
+            timestamp = datetime.datetime.strptime(
+                "{} {}".format(date, time), "%Y-%m-%d %H:%M:%S"
+            ).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            print("Wrong date or time value.")
+            return
 
-        self.shell_cmd_exec('sudo date -s "' + date + " " + time + '"')
+        success, output = self.run_command_with_stderr(["sudo", "date", "-s", timestamp])
+        if success:
+            if output:
+                print(output.decode("utf-8", errors="replace").strip() if isinstance(output, bytes) else str(output).strip())
+        else:
+            message = output.decode("utf-8", errors="replace").strip() if isinstance(output, bytes) else str(output)
+            print("Failed to set system time: {}".format(message))
 
     def _detect_ntp_type(self):
         """Validate that the supported NTPsec backend is usable."""
@@ -3725,45 +3913,75 @@ class AellaCli(cmd.Cmd, object):
             print(e)
 
     def set_patches_callback(self, key, param):
-        if not param or param[0].endswith('?') or len(param) < 1:
+        if not param or param[0].endswith('?'):
             print('\n<String> \t Specify patches string, use "set patch apply <patch_name>" to apply patch from StellarCyber\n')
             return
-        patches = param[0]
+
         try:
-            if patches == "apply":
-                self.run_command_with_stderr("sudo mkdir -p {}".format(PATCH_LOG_DIR))
-                if len(param) < 2 or param[1] == "?":
+            if param[0] == "apply":
+                if len(param) != 2 or param[1] == "?":
                     print('\n<String> \t Specify the Stellar patch name to apply\n')
                     return
                 patch_name = param[1]
-                log_file = "{}/{}.log".format(PATCH_LOG_DIR, patch_name)
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", patch_name) or ".." in patch_name:
+                    print("Invalid patch name. Use a file name without directory components.")
+                    return
 
+                log_file = os.path.join(PATCH_LOG_DIR, "{}.log".format(patch_name))
+                local_file = os.path.join(PATCH_DIR, patch_name)
                 try:
                     with open(PATCH_HISTORY) as f:
                         patch_history = json.load(f)
-                except Exception as e:
+                except Exception:
                     patch_history = {}
 
+                created, output = self.run_command_with_stderr(
+                    ["sudo", "mkdir", "-p", PATCH_DIR, PATCH_LOG_DIR]
+                )
+                if not created:
+                    message = output.decode("utf-8", errors="replace").strip() if isinstance(output, bytes) else str(output)
+                    print("Failed to prepare patch directory: {}".format(message))
+                    return
+
                 url = "https://192.168.122.2:8443/hotfix/{}".format(patch_name)
-                local_file = "{}/{}".format(PATCH_DIR, patch_name)
-                cmd = ["wget", "--user={}".format(META_USER),
-                       "--password={}".format(META_TOKEN), "-O",
-                       local_file, "--no-check-certificate", url]
-                res, msg = self.run_command_with_stderr(cmd)
+                download_cmd = ["wget", "--user={}".format(META_USER),
+                                "--password={}".format(META_TOKEN), "-O",
+                                local_file, "--no-check-certificate", url]
+                res, msg = self.run_command_with_stderr(download_cmd)
                 if not res:
-                    error_msg = "Failed to download patch: {}".format(msg)
+                    message = msg.decode("utf-8", errors="replace").strip() if isinstance(msg, bytes) else str(msg)
+                    error_msg = "Failed to download patch: {}".format(message)
                     print(error_msg)
                     self.update_patch_history(patch_name, patch_history, log_file, False, error_msg)
                     return
                 success, msg = self.run_command_with_stderr(["sudo", "dpkg", "-i", local_file])
                 if success:
                     msg = "Success"
+                elif isinstance(msg, bytes):
+                    msg = msg.decode("utf-8", errors="replace").strip()
                 self.update_patch_history(patch_name, patch_history, log_file, success, msg)
                 print(msg)
             else:
+                package_specs = param
+                package_pattern = re.compile(
+                    r"^[a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?(?:=[A-Za-z0-9.+:~_-]+)?$"
+                )
+                if len(package_specs) > 32 or any(not package_pattern.fullmatch(item) for item in package_specs):
+                    print("Invalid package specification. Provide package names or package=version values only.")
+                    return
+
                 print("Applying updates...")
-                cmd = "sudo apt -qq update && sudo apt -qqy install {0} && sudo apt clean".format(patches)
-                self.shell_cmd_exec(cmd)
+                commands = [
+                    ["sudo", "apt", "-qq", "update"],
+                    ["sudo", "apt", "-qqy", "install", *package_specs],
+                    ["sudo", "apt", "clean"],
+                ]
+                for command in commands:
+                    success, output = self.run_command_with_stderr(command)
+                    if not success:
+                        message = output.decode("utf-8", errors="replace").strip() if isinstance(output, bytes) else str(output)
+                        print("Failed to run {}: {}".format(command[1], message))
+                        return
                 print("Successfully applied updates")
         except Exception as e:
             print("Failed to apply updates {}".format(e))
@@ -6000,11 +6218,18 @@ class AellaCli(cmd.Cmd, object):
         return True
 
     def is_device_exist(self, interface):
-        cmd = 'ip link show {}'.format(interface)
-        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-        output, err = p.communicate()
+        if not isinstance(interface, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface):
+            print("Invalid interface name.")
+            return False
 
-        if re.match('Device "{}" does not exist'.format(interface), err.decode('utf-8')):
+        result = subprocess.run(
+            ["ip", "link", "show", "dev", interface],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
             print('Device "{}" does not exist. Is it used by other virtual machine?'.format(interface))
             return False
         return True
