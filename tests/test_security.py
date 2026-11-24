@@ -1,5 +1,3 @@
-import contextlib
-import io
 import tempfile
 import types
 import unittest
@@ -142,6 +140,18 @@ class InputValidationTests(unittest.TestCase):
 
 
 class SystemPasswordTests(unittest.TestCase):
+    def test_invoking_user_is_resolved_from_sudo_uid(self):
+        with mock.patch.object(module.os, "geteuid", return_value=0), \
+             mock.patch.dict(module.os.environ, {"SUDO_UID": "1000", "SUDO_USER": "stellar"}, clear=True), \
+             mock.patch.object(module.pwd, "getpwuid", return_value=types.SimpleNamespace(pw_name="stellar")):
+            self.assertEqual(module._get_invoking_username(), "stellar")
+
+    def test_mismatched_sudo_identity_fails_closed(self):
+        with mock.patch.object(module.os, "geteuid", return_value=0), \
+             mock.patch.dict(module.os.environ, {"SUDO_UID": "1000", "SUDO_USER": "aella"}, clear=True), \
+             mock.patch.object(module.pwd, "getpwuid", return_value=types.SimpleNamespace(pw_name="stellar")):
+            self.assertIsNone(module._get_invoking_username())
+
     def test_unix_account_password_verification_uses_shadow_hash(self):
         stored_hash = "$6$rounds=5000$test$examplehash"
         with tempfile.TemporaryDirectory() as temp_dir:

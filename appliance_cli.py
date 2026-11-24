@@ -53,6 +53,31 @@ NTPSEC_SERVICE = "ntpsec"
 NTPSEC_QUERY_COMMAND = ["ntpq", "-pn"]
 
 
+def _get_invoking_username():
+    """Resolve the sudo caller from sudo-managed identity metadata."""
+    if os.geteuid() != 0:
+        return None
+
+    sudo_uid = os.environ.get("SUDO_UID")
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_uid is not None:
+        try:
+            username = pwd.getpwuid(int(sudo_uid)).pw_name
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+        if sudo_user and sudo_user != username:
+            return None
+        return username
+
+    # SUDO_USER without its paired SUDO_UID is inconsistent and is not trusted.
+    if sudo_user:
+        return None
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return None
+
+
 def _verify_system_account_password(username, password, shadow_path="/etc/shadow"):
     """Verify a password against the invoking Unix account's shadow hash."""
     if not username or not password or "\x00" in username or "\x00" in password:
@@ -580,16 +605,12 @@ class AellaCli(cmd.Cmd, object):
 
     def is_password_valid(self):
         passcode = getpass.getpass('Password: ')
-        if not passcode or os.geteuid() != 0:
+        if not passcode:
             return False
 
-        username = os.environ.get("SUDO_USER")
+        username = _get_invoking_username()
         if not username:
-            try:
-                username = pwd.getpwuid(os.getuid()).pw_name
-            except KeyError:
-                return False
-
+            return False
         # A user already running the CLI as root does not need an additional gate.
         if username == "root":
             return True
@@ -1649,7 +1670,7 @@ class AellaCli(cmd.Cmd, object):
             print('\nset password <Enter>\t Press enter to input password and ctrl-D to abort\n')
             return
 
-        invoking_user = os.environ.get("SUDO_USER", "")
+        invoking_user = _get_invoking_username() or ""
         if invoking_user in {"aella", "stellar"}:
             try:
                 pwd.getpwnam(invoking_user)
