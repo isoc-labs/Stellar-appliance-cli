@@ -1039,32 +1039,42 @@ class AellaCli(cmd.Cmd, object):
         return self._on_nested_command(line, self.restart_command_help, self.restart_command_callback)
 
     def restart_system_callback(self, key, param):
-        """Restart System"""
+        """Restart System."""
         ans = ""
-        while ans != "Y" and ans != "n" and ans != "y" and ans != "N":
-            ans = input('Restart Appliance, are you sure? [Y/n]: ')
-        if ans == "Y" or ans == "y":
-            print('Restarting...')
-            self.shell_cmd_exec('sync; reboot')
+        while ans not in {"Y", "n", "y", "N"}:
+            ans = input("Restart Appliance, are you sure? [Y/n]: ")
+        if ans in {"Y", "y"}:
+            print("Restarting...")
+            subprocess.run(["sync"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            subprocess.run(["reboot"], check=False)
         else:
-            print('Restarting operation aborted.')
+            print("Restarting operation aborted.")
 
     def _create_vm_start_callback(self, vm_name):
-        """Create a callback function for starting a VM"""
+        """Create a callback function for starting a VM."""
         def callback(key, param):
-            self.shell_cmd_exec('virsh start {}'.format(vm_name))
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", vm_name):
+                print("Invalid VM name.")
+                return
+            subprocess.run(["virsh", "start", vm_name], check=False)
         return callback
 
     def _create_vm_restart_callback(self, vm_name):
-        """Create a callback function for restarting a VM"""
+        """Create a callback function for restarting a VM."""
         def callback(key, param):
-            self.shell_cmd_exec('virsh reboot {}'.format(vm_name))
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", vm_name):
+                print("Invalid VM name.")
+                return
+            subprocess.run(["virsh", "reboot", vm_name], check=False)
         return callback
 
     def _create_vm_shutdown_callback(self, vm_name):
-        """Create a callback function for shutting down a VM"""
+        """Create a callback function for shutting down a VM."""
         def callback(key, param):
-            self.shell_cmd_exec('virsh shutdown {}'.format(vm_name))
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", vm_name):
+                print("Invalid VM name.")
+                return
+            subprocess.run(["virsh", "shutdown", vm_name], check=False)
         return callback
 
     def _reset_console_terminal(self, saved_attrs=None):
@@ -2970,18 +2980,37 @@ class AellaCli(cmd.Cmd, object):
         return self._on_nested_command(line, self.unset_command_help, self.unset_command_callback)
 
     def show_version(self, key, param):
-        print('')
-        print('Appliance Version : 3.10.1-appliance')
-        print('Hardware Revision : 1.5\n')
-        self.shell_cmd_exec('cat /sys/class/dmi/id/product_name | awk \'{printf   "Product Name  : "$1}\'', crlf=False)
-        self.shell_cmd_exec('sudo cat /sys/class/dmi/id/product_serial | awk \'{printf "Serial Number : "$1}\'', crlf=False)
-        print('\nAppliance CPUs')
-        print('------------------------------')
-        self.shell_cmd_exec('lscpu | grep -E "^Thread|^Core|^Socket|^CPU\("', crlf=False)
-        print('\nAppliance Memory')
-        print('--------------------------------')
-        self.shell_cmd_exec('cat /proc/meminfo  | egrep "Mem|Swap"', crlf=False)
-        print('')
+        print("")
+        print("Appliance Version : 3.10.1-appliance")
+        print("Hardware Revision : 1.5\n")
+        for path, label in (
+            ("/sys/class/dmi/id/product_name", "Product Name"),
+            ("/sys/class/dmi/id/product_serial", "Serial Number"),
+        ):
+            try:
+                value = Path(path).read_text(encoding="utf-8", errors="replace").strip()
+                print("{:<15}: {}".format(label, value))
+            except OSError:
+                print("{:<15}: unavailable".format(label))
+        print("\nAppliance CPUs")
+        print("------------------------------")
+        cpu_info = subprocess.run(
+            ["lscpu"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False,
+        )
+        if cpu_info.returncode == 0:
+            for line in cpu_info.stdout.splitlines():
+                if re.match(r"^(Thread|Core|Socket|CPU\()", line):
+                    print(line)
+        print("\nAppliance Memory")
+        print("--------------------------------")
+        try:
+            for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+                if line.startswith(("Mem", "Swap")):
+                    print(line)
+        except OSError as exc:
+            print("Unable to read memory information: {}".format(exc))
+        print("")
 
     def show_hostname(self, key, param):
         self.shell_cmd_exec('hostname')
@@ -3383,189 +3412,119 @@ class AellaCli(cmd.Cmd, object):
             print("Failed to monitor VMs: {}\n".format(exc))
 
     def monitor_system_callback(self, key, param):
-        """Check system health status"""
+        """Check system health status using direct file reads and argv-only commands."""
         try:
-            # 1. CPU load
             try:
-                with open('/proc/loadavg', 'r') as f:
-                    loadavg = f.read().strip().split()
-                    load_1min = float(loadavg[0])
-                    load_5min = float(loadavg[1])
-                    load_15min = float(loadavg[2])
-                
-                # Get CPU core count
-                cmd = "nproc"
-                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out, _ = proc.communicate()
-                cpu_cores = int(out.decode('utf-8', errors='ignore').strip()) if out else 1
-                
-                # Calculate per-core load
-                per_core_1min = load_1min / cpu_cores if cpu_cores > 0 else 0
-                per_core_5min = load_5min / cpu_cores if cpu_cores > 0 else 0
-                per_core_15min = load_15min / cpu_cores if cpu_cores > 0 else 0
-                
-                # Determine status based on per-core load
-                if per_core_1min > 1.0:
-                    status = 'CRIT'
-                elif per_core_1min > 0.7:
-                    status = 'WARN'
-                else:
-                    status = 'OK'
-                
-                print('[{}]   load: {:.1f} {:.1f} {:.1f} (cores={}, per-core={:.2f} {:.2f} {:.2f})'.format(
-                    status, load_1min, load_5min, load_15min, cpu_cores, 
-                    per_core_1min, per_core_5min, per_core_15min))
-            except Exception as e:
-                print('[ERR]  load: failed to check ({})'.format(e))
-            
-            # 2. Memory availability
+                loadavg = Path("/proc/loadavg").read_text(encoding="utf-8").strip().split()
+                load_1min, load_5min, load_15min = map(float, loadavg[:3])
+                cpu_cores = os.cpu_count() or 1
+                per_core_1min = load_1min / cpu_cores
+                per_core_5min = load_5min / cpu_cores
+                per_core_15min = load_15min / cpu_cores
+                status = "CRIT" if per_core_1min > 1.0 else "WARN" if per_core_1min > 0.7 else "OK"
+                print("[{}]   load: {:.1f} {:.1f} {:.1f} (cores={}, per-core={:.2f} {:.2f} {:.2f})".format(
+                    status, load_1min, load_5min, load_15min, cpu_cores,
+                    per_core_1min, per_core_5min, per_core_15min,
+                ))
+            except Exception as exc:
+                print("[ERR]  load: failed to check ({})".format(exc))
+
             try:
-                with open('/proc/meminfo', 'r') as f:
-                    meminfo = f.read()
-                    mem_total = 0
-                    mem_available = 0
-                    for line in meminfo.split('\n'):
-                        if line.startswith('MemTotal:'):
-                            mem_total = int(line.split()[1])
-                        elif line.startswith('MemAvailable:'):
-                            mem_available = int(line.split()[1])
-                
+                meminfo = Path("/proc/meminfo").read_text(encoding="utf-8")
+                values = {}
+                for line in meminfo.splitlines():
+                    fields = line.split()
+                    if len(fields) >= 2 and fields[0].rstrip(":") in {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}:
+                        values[fields[0].rstrip(":")] = int(fields[1])
+                mem_total = values.get("MemTotal", 0)
+                mem_available = values.get("MemAvailable", 0)
                 if mem_total > 0:
                     mem_percent = (mem_available / mem_total) * 100
-                    mem_total_gb = mem_total / (1024.0 * 1024.0)
-                    mem_available_gb = mem_available / (1024.0 * 1024.0)
-                    
-                    if mem_percent > 20:
-                        print('[OK]   mem: {:.0f}% available ({:.0f}GiB / {:.0f}GiB)'.format(
-                            mem_percent, mem_available_gb, mem_total_gb))
-                    else:
-                        print('[WARN] mem: {:.0f}% available ({:.0f}GiB / {:.0f}GiB)'.format(
-                            mem_percent, mem_available_gb, mem_total_gb))
+                    total_gb = mem_total / (1024.0 * 1024.0)
+                    available_gb = mem_available / (1024.0 * 1024.0)
+                    status = "OK" if mem_percent > 20 else "WARN"
+                    print("[{}]   mem: {:.0f}% available ({:.0f}GiB / {:.0f}GiB)".format(
+                        status, mem_percent, available_gb, total_gb,
+                    ))
                 else:
-                    print('[ERR]  mem: failed to get memory info')
-            except Exception as e:
-                print('[ERR]  mem: failed to check ({})'.format(e))
-            
-            # 3. Swap usage
-            try:
-                with open('/proc/meminfo', 'r') as f:
-                    meminfo = f.read()
-                    swap_total = 0
-                    swap_free = 0
-                    for line in meminfo.split('\n'):
-                        if line.startswith('SwapTotal:'):
-                            swap_total = int(line.split()[1])
-                        elif line.startswith('SwapFree:'):
-                            swap_free = int(line.split()[1])
-                
+                    print("[ERR]  mem: failed to get memory info")
+                swap_total = values.get("SwapTotal", 0)
+                swap_free = values.get("SwapFree", 0)
                 if swap_total > 0:
-                    swap_used_kb = swap_total - swap_free
-                    swap_used_gb = swap_used_kb / (1024.0 * 1024.0)
-                    if swap_used_kb > 0:
-                        print('[WARN] swap: {:.1f}G used'.format(swap_used_gb))
-                    else:
-                        print('[OK]   swap: not in use')
+                    swap_used_gb = (swap_total - swap_free) / (1024.0 * 1024.0)
+                    print("[WARN] swap: {:.1f}G used".format(swap_used_gb) if swap_free < swap_total else "[OK]   swap: not in use")
                 else:
-                    print('[OK]   swap: not configured')
-            except Exception as e:
-                print('[ERR]  swap: failed to check ({})'.format(e))
-            
-            # 4. Root filesystem usage
-            try:
-                cmd = "df -h / | tail -1"
-                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out, _ = proc.communicate()
-                if out:
-                    parts = out.decode('utf-8', errors='ignore').strip().split()
-                    if len(parts) >= 5:
-                        usage_str = parts[4].rstrip('%')
-                        usage = int(usage_str)
-                        used = parts[2]  # Used column
-                        size = parts[1]  # Size column
-                        if usage < 80:
-                            print('[OK]   /: {}% used ({} / {})'.format(usage, used, size))
-                        else:
-                            print('[WARN] /: {}% used ({} / {})'.format(usage, used, size))
-            except Exception as e:
-                print('[ERR]  /: failed to check ({})'.format(e))
-            
-            # 5. /stellar filesystem usage (only if mount exists)
-            try:
-                if os.path.exists('/stellar'):
-                    cmd = "df -h /stellar 2>/dev/null | tail -1"
-                    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    out, _ = proc.communicate()
-                    if out and out.strip():
-                        parts = out.decode('utf-8', errors='ignore').strip().split()
-                        if len(parts) >= 5:
-                            usage_str = parts[4].rstrip('%')
-                            usage = int(usage_str)
-                            used = parts[2]  # Used column
-                            size = parts[1]  # Size column
-                            if usage < 80:
-                                print('[OK]   /stellar: {}% used ({} / {})'.format(usage, used, size))
-                            else:
-                                print('[WARN] /stellar: {}% used ({} / {})'.format(usage, used, size))
-            except Exception as e:
-                pass  # Silently skip if /stellar doesn't exist or can't be checked
-            
-            # 6. libvirt service status
-            try:
-                libvirt_status = None
-                # Try libvirtd first (older systems)
-                cmd = "systemctl is-active libvirtd 2>/dev/null"
-                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out, _ = proc.communicate()
-                if proc.returncode == 0 and out:
-                    libvirt_status = out.decode('utf-8', errors='ignore').strip()
-                else:
-                    # Try virtqemud (newer systems)
-                    cmd = "systemctl is-active virtqemud 2>/dev/null"
-                    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    out, _ = proc.communicate()
-                    if proc.returncode == 0 and out:
-                        libvirt_status = out.decode('utf-8', errors='ignore').strip()
-                
-                if libvirt_status:
-                    # Get VM counts
-                    running_count = 0
-                    defined_count = 0
-                    try:
-                        # Get running VMs
-                        cmd = "virsh list --name 2>/dev/null"
-                        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        out, _ = proc.communicate()
-                        if proc.returncode == 0 and out:
-                            running_list = [vm.strip() for vm in out.decode('utf-8', errors='ignore').split('\n') if vm.strip()]
-                            running_count = len(running_list)
-                        
-                        # Get all defined VMs
-                        cmd = "virsh list --all --name 2>/dev/null"
-                        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        out, _ = proc.communicate()
-                        if proc.returncode == 0 and out:
-                            defined_list = [vm.strip() for vm in out.decode('utf-8', errors='ignore').split('\n') if vm.strip()]
-                            defined_count = len(defined_list)
-                    except Exception:
-                        pass  # If VM count fails, just show service status
-                    
-                    if libvirt_status == 'active':
-                        if running_count > 0 or defined_count > 0:
-                            print('[OK]   libvirt: active (vms running {} / defined {})'.format(running_count, defined_count))
-                        else:
-                            print('[OK]   libvirt: active')
-                    else:
-                        print('[WARN] libvirt: {}'.format(libvirt_status))
-                else:
-                    print('[WARN] libvirt: service not found')
-            except Exception as e:
-                print('[ERR]  libvirt: failed to check ({})'.format(e))
-            
-            print('')
-        except Exception as e:
-            print('Failed to check system health: {}\n'.format(e))
+                    print("[OK]   swap: not configured")
+            except Exception as exc:
+                print("[ERR]  mem/swap: failed to check ({})".format(exc))
 
-    @staticmethod
+            def report_filesystem(mountpoint, label):
+                proc = subprocess.run(
+                    ["df", "-h", mountpoint],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, check=False,
+                )
+                rows = proc.stdout.splitlines()
+                if proc.returncode != 0 or len(rows) < 2:
+                    return
+                parts = rows[-1].split()
+                if len(parts) < 5:
+                    return
+                try:
+                    usage = int(parts[4].rstrip("%"))
+                except ValueError:
+                    return
+                status = "OK" if usage < 80 else "WARN"
+                print("[{}]   {}: {}% used ({} / {})".format(status, label, usage, parts[2], parts[1]))
+
+            try:
+                report_filesystem("/", "/")
+            except Exception as exc:
+                print("[ERR]  /: failed to check ({})".format(exc))
+            if os.path.exists("/stellar"):
+                try:
+                    report_filesystem("/stellar", "/stellar")
+                except Exception:
+                    pass
+
+            try:
+                libvirt_status = ""
+                for service in ("libvirtd", "virtqemud"):
+                    proc = subprocess.run(
+                        ["systemctl", "is-active", service],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, check=False,
+                    )
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        libvirt_status = proc.stdout.strip()
+                        break
+                if not libvirt_status:
+                    print("[WARN] libvirt: service not found")
+                else:
+                    running = subprocess.run(
+                        ["virsh", "list", "--name"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, check=False,
+                    )
+                    defined = subprocess.run(
+                        ["virsh", "list", "--all", "--name"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, check=False,
+                    )
+                    running_count = len([name for name in running.stdout.splitlines() if name.strip()]) if running.returncode == 0 else 0
+                    defined_count = len([name for name in defined.stdout.splitlines() if name.strip()]) if defined.returncode == 0 else 0
+                    if libvirt_status == "active":
+                        if running_count or defined_count:
+                            print("[OK]   libvirt: active (vms running {} / defined {})".format(running_count, defined_count))
+                        else:
+                            print("[OK]   libvirt: active")
+                    else:
+                        print("[WARN] libvirt: {}".format(libvirt_status))
+            except Exception as exc:
+                print("[ERR]  libvirt: failed to check ({})".format(exc))
+        except Exception as exc:
+            print("System health check failed: {}".format(exc))
+
     def show_patch_history_callback(key, params):
         try:
             _ensure_patch_storage()
