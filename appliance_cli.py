@@ -2807,380 +2807,338 @@ class AellaCli(cmd.Cmd, object):
         return self._get_acl_ipv4("mgt")
 
     def _acl_iface_exists(self, interface: str) -> bool:
-        cmd = "ip link show {}".format(interface)
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        _, err = proc.communicate()
-        if proc.returncode != 0:
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface or ""):
             return False
-        if err:
-            err_text = err.decode("utf-8", errors="ignore")
-            if 'does not exist' in err_text:
-                return False
-        return True
-
-    def _default_acl_iface(self) -> str:
-        if self._acl_iface_exists("mgt"):
-            return "mgt"
-        if self._acl_iface_exists("host") or self._acl_iface_exists("hostmgmt"):
-            return "host"
-        return "mgt"
+        proc = subprocess.run(
+            ["ip", "link", "show", "dev", interface],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        return proc.returncode == 0
 
     def _get_acl_ipv4(self, interface: str) -> str:
-        interface = interface.strip().lower()
-        if interface not in {"mgt", "host"}:
-            raise RuntimeError("Unsupported ACL interface: {}".format(interface))
-        cmd = "ip -4 addr show dev {}".format(interface)
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = proc.communicate()
-        if proc.returncode != 0 or not out:
-            if interface == "host":
-                cmd_alt = "ip -4 addr show dev hostmgmt"
-                proc_alt = subprocess.Popen(cmd_alt, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out_alt, err_alt = proc_alt.communicate()
-                if proc_alt.returncode == 0 and out_alt:
-                    out = out_alt
-                    err = err_alt
-                else:
-                    err_msg = err.decode("utf-8", errors="ignore").strip() if err else "host IPv4 not found"
-                    raise RuntimeError("Failed to get host IPv4 address: {}".format(err_msg))
-            else:
-                err_msg = err.decode("utf-8", errors="ignore").strip() if err else "mgt IPv4 not found"
-                if self._acl_iface_exists("host") or self._acl_iface_exists("hostmgmt"):
-                    return self._get_acl_ipv4("host")
-                raise RuntimeError("Failed to get mgt IPv4 address: {}".format(err_msg))
-        output = out.decode("utf-8", errors="ignore")
-        match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", output)
-        if not match:
-            raise RuntimeError("Failed to parse {} IPv4 address".format(interface))
-        return match.group(1)
-
-    @staticmethod
-    def _is_user_acl_rule_line(rule_line: str) -> bool:
-        if "AELLA_ACL_AUTO" in rule_line:
-            return False
-        return ACL_COMMENT_PREFIX.strip() in rule_line
-
-    def _ensure_local_ip_allow_rules(self):
-        """Ensure local interface IPs are always allowed"""
-        for dest_ip in ALWAYS_ALLOW_DEST_IPS:
-            cidr = "{}/32".format(dest_ip)
-            cmd_check = (
-                "sudo iptables -C INPUT -d {} -m comment --comment \"{}\" -j ACCEPT"
-            ).format(cidr, LOCAL_ALWAYS_ALLOW_COMMENT)
-            proc = subprocess.Popen(cmd_check, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            proc.communicate()
-
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface or ""):
+            raise RuntimeError("Unsupported ACL interface")
+        candidates = [interface]
+        if interface == "host":
+            candidates.append("hostmgmt")
+        for candidate in candidates:
+            proc = subprocess.run(
+                ["ip", "-4", "addr", "show", "dev", candidate],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            )
             if proc.returncode != 0:
-                cmd_add = (
-                    "sudo iptables -I INPUT 1 -d {} -m comment --comment \"{}\" -j ACCEPT"
-                ).format(cidr, LOCAL_ALWAYS_ALLOW_COMMENT)
-                subprocess.Popen(cmd_add, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+                continue
+            match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", proc.stdout)
+            if match:
+                return match.group(1)
+        raise RuntimeError("No IPv4 address found for ACL interface {}".format(interface))
+
+    def _ensure_local_ip_allow_rules(self, cidrs):
+        for cidr in cidrs:
+            try:
+                normalized = str(ipaddress.ip_network(cidr, strict=False))
+            except ValueError:
+                continue
+            args = [
+                "sudo", "iptables", "-C", "INPUT", "-d", normalized,
+                "-m", "comment", "--comment", LOCAL_ALWAYS_ALLOW_COMMENT,
+                "-j", "ACCEPT",
+            ]
+            check = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            if check.returncode != 0:
+                add = [
+                    "sudo", "iptables", "-I", "INPUT", "1", "-d", normalized,
+                    "-m", "comment", "--comment", LOCAL_ALWAYS_ALLOW_COMMENT,
+                    "-j", "ACCEPT",
+                ]
+                subprocess.run(add, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
 
     def _ensure_established_related_rule(self):
-        cmd_check = "sudo iptables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
-        proc = subprocess.Popen(cmd_check, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        proc.communicate()
-        if proc.returncode != 0:
-            cmd_add = (
-                "sudo iptables -I INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED "
-                "-j ACCEPT -m comment --comment \"AELLA_SYSTEM Allow established\""
+        args = [
+            "sudo", "iptables", "-C", "INPUT", "-m", "conntrack",
+            "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT",
+            "-m", "comment", "--comment", AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT,
+        ]
+        check = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if check.returncode != 0:
+            subprocess.run(
+                ["sudo", "iptables", "-I", "INPUT", "1"] + args[2:],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
             )
-            subprocess.Popen(cmd_add, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
 
     def _purge_legacy_local_always_allow_rules(self):
-        """
-        Remove legacy destination-based allow rules that bypass deny-all:
-          ACCEPT all 0.0.0.0/0 -> <host_ip> /* Local interface IP - always allow */
-        Keep only 127.0.0.1, 192.168.0.100, and 192.168.122.1 if such legacy rules exist.
-        """
-        keep = {"127.0.0.1", "192.168.0.100", "192.168.122.1"}
-        cmd = "sudo iptables -L INPUT -n -v --line-numbers"
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, _ = proc.communicate()
-        if proc.returncode != 0 or not out:
+        proc = subprocess.run(
+            ["sudo", "iptables", "-L", "INPUT", "-n", "-v", "--line-numbers"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        if proc.returncode != 0:
             return
-
-        lines = out.decode("utf-8", errors="ignore").splitlines()
-        to_delete = []
-        for line in lines:
-            if "Local interface IP - always allow" not in line:
+        line_numbers = []
+        for line in proc.stdout.splitlines():
+            if LOCAL_ALWAYS_ALLOW_COMMENT not in line:
                 continue
-            parts = line.split()
-            if len(parts) < 10:
-                continue
-            try:
-                num = int(parts[0])
-            except Exception:
-                continue
-            dest = parts[9] if len(parts) > 9 else ""
-            if dest in keep:
-                continue
-            to_delete.append(num)
+            match = re.match(r"^\s*(\d+)\s+", line)
+            if match:
+                line_numbers.append(int(match.group(1)))
+        for number in sorted(set(line_numbers), reverse=True):
+            subprocess.run(
+                ["sudo", "iptables", "-D", "INPUT", str(number)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
 
-        for num in sorted(to_delete, reverse=True):
-            subprocess.Popen(
-                "sudo iptables -D INPUT {}".format(num),
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            ).communicate()
-
-    def _get_current_ssh_client_ip(self):
-        """Get current SSH client IPv4 address if available"""
-        return self.get_current_ssh_client_ip()
-
-    def _iptables_add_auto_ssh(self, ssh_ip):
-        """Add auto-allow rule for current SSH client"""
-        cidr = "{}/32".format(ssh_ip)
-        comment_part = '-m comment --comment "{}"'.format(ACL_AUTO_COMMENT)
-        check_cmd = "sudo iptables -C INPUT -s {} -p tcp --dport 22 {} -j ACCEPT".format(cidr, comment_part)
-        check_proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        check_proc.communicate()
-        if check_proc.returncode == 0:
+    def _iptables_add_auto_ssh(self, ssh_ip: str) -> None:
+        try:
+            normalized_ip = str(ipaddress.ip_address(ssh_ip))
+        except ValueError:
             return
+        if ":" in normalized_ip:
+            return
+        args = [
+            "sudo", "iptables", "-C", "INPUT", "-s", normalized_ip,
+            "-p", "tcp", "--dport", "22", "-m", "comment",
+            "--comment", ACL_AUTO_COMMENT, "-j", "ACCEPT",
+        ]
+        check = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if check.returncode != 0:
+            subprocess.run(
+                ["sudo", "iptables", "-I", "INPUT", "-s", normalized_ip,
+                 "-p", "tcp", "--dport", "22", "-m", "comment",
+                 "--comment", ACL_AUTO_COMMENT, "-j", "ACCEPT"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
 
-        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport 22 {} -j ACCEPT".format(cidr, comment_part)
-        subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-
-    def _load_acl_staging(self):
-        """Load staged ACL rules from file"""
+    def _load_acl_staging(self) -> dict:
         default_data = {"rules": []}
         try:
-            with open(ACL_STAGING_PATH, "r") as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            return default_data
-        except PermissionError:
-            proc = subprocess.run(
-                ["sudo", "cat", ACL_STAGING_PATH],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-            if proc.returncode != 0 or not proc.stdout:
-                return default_data
-            try:
-                data = json.loads(proc.stdout)
-            except json.JSONDecodeError:
-                return default_data
-        except json.JSONDecodeError:
-            return default_data
+            _ensure_root_owned_directory("/var/lib/aella", mode=0o750)
+            data = json.loads(_read_root_text_file(ACL_STAGING_PATH))
         except Exception:
             return default_data
-
-        if not isinstance(data, dict) or "rules" not in data or not isinstance(data["rules"], list):
+        if not isinstance(data, dict) or not isinstance(data.get("rules", []), list):
             return default_data
-        return data
 
-    def _save_acl_staging(self, data):
-        """Save staged ACL rules to file"""
-        target_dir = os.path.dirname(ACL_STAGING_PATH)
-        make_dir(target_dir, root=True)
+        valid_rules = []
+        for rule in data.get("rules", []):
+            if not isinstance(rule, dict) or rule.get("action") not in {"allow", "deny"}:
+                continue
+            source = rule.get("source")
+            try:
+                source = str(ipaddress.ip_network(source, strict=False))
+            except (TypeError, ValueError):
+                continue
+            ports = rule.get("ports")
+            if not isinstance(ports, list) or not ports:
+                continue
+            normalized_ports = []
+            valid = True
+            for port in ports:
+                value = str(port).lower()
+                if value in {"all", "icmp", "ping"}:
+                    normalized_ports.append("icmp" if value == "ping" else value)
+                elif value.isdigit() and 1 <= int(value) <= 65535:
+                    normalized_ports.append(value)
+                else:
+                    valid = False
+                    break
+            if not valid:
+                continue
+            description = rule.get("desc", "")
+            if not isinstance(description, str):
+                description = ""
+            description = "".join(ch for ch in description if ch.isprintable())[:180]
+            valid_rules.append({
+                "action": rule["action"],
+                "source": source,
+                "ports": normalized_ports,
+                "desc": description,
+            })
+        return {"rules": valid_rules}
+
+    def _save_acl_staging(self, data: dict) -> None:
+        _ensure_root_owned_directory("/var/lib/aella", mode=0o750)
         payload = json.dumps(data, indent=2, sort_keys=False)
-        tmp_path = "/tmp/acl_staging.json"
+        _write_root_text_file(ACL_STAGING_PATH, payload)
+
+    def _run_cmd(self, cmd) -> tuple[int, str, str]:
+        """Execute argv or parse a legacy command string without a shell."""
         try:
-            with open(tmp_path, "w") as f:
-                f.write(payload)
-            subprocess.run(
-                ["sudo", "mv", tmp_path, ACL_STAGING_PATH],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-        except Exception:
-            try:
-                subprocess.run(
-                    ["sudo", "tee", ACL_STAGING_PATH],
-                    input=payload,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=False,
-                )
-            except Exception:
-                pass
-
-    # =========================
-    # ACL HELPERS (NEW DESIGN)
-    # =========================
-
-    def _run_cmd(self, cmd: str) -> tuple[int, str, str]:
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = proc.communicate()
-        return proc.returncode, (out.decode("utf-8", errors="ignore") if out else ""), (err.decode("utf-8", errors="ignore") if err else "")
+            argv = shlex.split(cmd) if isinstance(cmd, str) else list(cmd)
+        except (TypeError, ValueError) as exc:
+            return 2, "", str(exc)
+        if not argv or any(not isinstance(item, str) for item in argv):
+            return 2, "", "Invalid command arguments"
+        proc = subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False,
+        )
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
 
     def _load_acl_state(self) -> dict:
-        default_data: dict = {}
+        default_data = {}
         try:
-            with open(ACL_STATE_PATH, "r") as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            return default_data
-        except PermissionError:
-            rc, out, _ = self._run_cmd(f"sudo cat {shlex.quote(ACL_STATE_PATH)}")
-            if rc != 0 or not out:
-                return default_data
-            try:
-                data = json.loads(out)
-            except Exception:
-                return default_data
+            _ensure_root_owned_directory("/var/lib/aella", mode=0o750)
+            data = json.loads(_read_root_text_file(ACL_STATE_PATH))
         except Exception:
             return default_data
-
         if not isinstance(data, dict):
             return default_data
         mode = data.get("mode")
         iface = data.get("iface")
-        if mode not in ("whitelist", "blacklist") or not iface:
+        if mode not in ("whitelist", "blacklist") or not isinstance(iface, str):
             return default_data
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", iface):
+            return default_data
+        iface_ip = data.get("iface_ip")
+        if iface_ip is not None:
+            try:
+                data["iface_ip"] = str(ipaddress.IPv4Address(iface_ip))
+            except ValueError:
+                return default_data
         return data
 
     def _save_acl_state(self, data: dict) -> None:
-        target_dir = os.path.dirname(ACL_STATE_PATH)
-        make_dir(target_dir, root=True)
-        payload = json.dumps(data, indent=2, sort_keys=False)
-        tmp_path = "/tmp/acl_state.json"
-        try:
-            with open(tmp_path, "w") as f:
-                f.write(payload)
-            self._run_cmd(f"sudo mv {shlex.quote(tmp_path)} {shlex.quote(ACL_STATE_PATH)}")
-        except Exception:
-            self._run_cmd(f"echo {shlex.quote(payload)} | sudo tee {shlex.quote(ACL_STATE_PATH)} >/dev/null")
+        _ensure_root_owned_directory("/var/lib/aella", mode=0o750)
+        _write_root_text_file(ACL_STATE_PATH, json.dumps(data, indent=2, sort_keys=False))
 
     def _clear_acl_state(self) -> None:
-        self._run_cmd(f"sudo rm -f {shlex.quote(ACL_STATE_PATH)}")
+        _ensure_root_owned_directory("/var/lib/aella", mode=0o750)
+        if os.path.lexists(ACL_STATE_PATH):
+            os.unlink(ACL_STATE_PATH)
 
     def _get_iface_ipv4(self, iface: str) -> str:
-        # 반드시 ip -4 addr show dev <iface> 로만 취득
-        rc, out, err = self._run_cmd(f"ip -4 addr show dev {shlex.quote(iface)}")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", iface or ""):
+            raise RuntimeError("Invalid interface name")
+        rc, out, err = self._run_cmd(["ip", "-4", "addr", "show", "dev", iface])
         if rc != 0 or not out:
-            raise RuntimeError(f"Failed to get IPv4 for iface={iface}: {err.strip()}")
-        m = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", out)
-        if not m:
-            raise RuntimeError(f"No IPv4 found on iface={iface}")
-        return m.group(1)
-
-    def _list_acl_candidate_ifaces(self) -> list[tuple[str, str]]:
-        """
-        Return list of (iface, ipv4) candidates:
-          - has IPv4
-          - exclude iface whose IPv4 in ACL_EXCLUDE_IPS (192.168.0.100, 192.168.122.1)
-          - exclude lo
-        """
-        candidates: list[tuple[str, str]] = []
-        try:
-            for name in os.listdir("/sys/class/net"):
-                if name == "lo":
-                    continue
-                try:
-                    ip = self._get_iface_ipv4(name)
-                except Exception:
-                    continue
-                if ip in ACL_EXCLUDE_IPS:
-                    continue
-                candidates.append((name, ip))
-        except Exception:
-            pass
-        return candidates
+            raise RuntimeError("Failed to get IPv4 for iface={}: {}".format(iface, err.strip()))
+        match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", out)
+        if not match:
+            raise RuntimeError("No IPv4 found on iface={}".format(iface))
+        return match.group(1)
 
     def _iptables_chain_exists(self, chain: str) -> bool:
-        rc, _, _ = self._run_cmd(f"sudo iptables -S {shlex.quote(chain)}")
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,28}", chain or ""):
+            return False
+        rc, _, _ = self._run_cmd(["sudo", "iptables", "-S", chain])
         return rc == 0
 
     def _iptables_ensure_chain(self, chain: str) -> None:
-        if self._iptables_chain_exists(chain):
-            return
-        self._run_cmd(f"sudo iptables -N {shlex.quote(chain)}")
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,28}", chain or ""):
+            raise ValueError("Invalid iptables chain name")
+        if not self._iptables_chain_exists(chain):
+            rc, _, err = self._run_cmd(["sudo", "iptables", "-N", chain])
+            if rc != 0:
+                raise RuntimeError("Failed to create iptables chain {}: {}".format(chain, err.strip()))
 
     def _iptables_flush_chain(self, chain: str) -> None:
-        if not self._iptables_chain_exists(chain):
-            return
-        self._run_cmd(f"sudo iptables -F {shlex.quote(chain)}")
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,28}", chain or ""):
+            raise ValueError("Invalid iptables chain name")
+        rc, _, err = self._run_cmd(["sudo", "iptables", "-F", chain])
+        if rc != 0:
+            raise RuntimeError("Failed to flush iptables chain {}: {}".format(chain, err.strip()))
 
     def _iptables_delete_chain(self, chain: str) -> None:
-        if not self._iptables_chain_exists(chain):
-            return
-        # must be flushed and unreferenced
-        self._run_cmd(f"sudo iptables -F {shlex.quote(chain)}")
-        self._run_cmd(f"sudo iptables -X {shlex.quote(chain)}")
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,28}", chain or ""):
+            raise ValueError("Invalid iptables chain name")
+        if self._iptables_chain_exists(chain):
+            self._run_cmd(["sudo", "iptables", "-F", chain])
+            self._run_cmd(["sudo", "iptables", "-X", chain])
 
-    def _iptables_rule_check(self, table_chain: str, rule_args: str) -> bool:
-        # iptables -C <chain> <args>
-        rc, _, _ = self._run_cmd(f"sudo iptables -C {shlex.quote(table_chain)} {rule_args}")
+    def _iptables_rule_check(self, table_chain, rule_args):
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,28}", table_chain or ""):
+            return False
+        try:
+            args = shlex.split(rule_args) if isinstance(rule_args, str) else list(rule_args)
+        except (TypeError, ValueError):
+            return False
+        rc, _, _ = self._run_cmd(["sudo", "iptables", "-C", table_chain] + args)
         return rc == 0
 
-    def _iptables_rule_insert(self, table_chain: str, position: int | None, rule_args: str) -> None:
+    def _iptables_rule_insert(self, table_chain: str, position: int | None, rule_args) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,28}", table_chain or ""):
+            raise ValueError("Invalid iptables chain name")
+        args = shlex.split(rule_args) if isinstance(rule_args, str) else list(rule_args)
+        command = ["sudo", "iptables"]
         if position is None:
-            cmd = f"sudo iptables -A {shlex.quote(table_chain)} {rule_args}"
+            command.extend(["-A", table_chain])
         else:
-            cmd = f"sudo iptables -I {shlex.quote(table_chain)} {position} {rule_args}"
-        self._run_cmd(cmd)
+            if not isinstance(position, int) or position < 1:
+                raise ValueError("Invalid iptables rule position")
+            command.extend(["-I", table_chain, str(position)])
+        command.extend(args)
+        rc, _, err = self._run_cmd(command)
+        if rc != 0:
+            raise RuntimeError("Failed to insert iptables rule: {}".format(err.strip()))
 
-    def _iptables_rule_delete(self, table_chain: str, rule_args: str) -> None:
-        self._run_cmd(f"sudo iptables -D {shlex.quote(table_chain)} {rule_args}")
+    def _iptables_rule_delete(self, table_chain: str, rule_args) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,28}", table_chain or ""):
+            raise ValueError("Invalid iptables chain name")
+        args = shlex.split(rule_args) if isinstance(rule_args, str) else list(rule_args)
+        rc, _, err = self._run_cmd(["sudo", "iptables", "-D", table_chain] + args)
+        if rc != 0:
+            raise RuntimeError("Failed to delete iptables rule: {}".format(err.strip()))
 
     def _ensure_aella_system_rules(self, iface: str) -> None:
-        """
-        Ensure ONLY when applying (rules exist):
-          - INPUT top: ESTABLISHED,RELATED accept (with comment)
-          - INPUT: jump to AELLA_INPUT for selected iface (with comment)
-          - AELLA_INPUT chain exists
-        """
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", iface or ""):
+            raise ValueError("Invalid ACL interface")
         self._iptables_ensure_chain(AELLA_INPUT_CHAIN)
-
-        est_args = f'-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT -m comment --comment "{AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT}"'
-        if not self._iptables_rule_check("INPUT", est_args):
-            # place at very top
-            self._iptables_rule_insert("INPUT", 1, est_args)
-
-        jump_args = f'-i {shlex.quote(iface)} -j {AELLA_INPUT_CHAIN} -m comment --comment "{AELLA_SYSTEM_JUMP_COMMENT}"'
-        if not self._iptables_rule_check("INPUT", jump_args):
-            # place just after established if possible
-            self._iptables_rule_insert("INPUT", 2, jump_args)
+        established = [
+            "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+            "-j", "ACCEPT", "-m", "comment", "--comment",
+            AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT,
+        ]
+        if not self._iptables_rule_check("INPUT", established):
+            self._iptables_rule_insert("INPUT", 1, established)
+        jump = [
+            "-i", iface, "-j", AELLA_INPUT_CHAIN,
+            "-m", "comment", "--comment", AELLA_SYSTEM_JUMP_COMMENT,
+        ]
+        if not self._iptables_rule_check("INPUT", jump):
+            self._iptables_rule_insert("INPUT", 2, jump)
 
     def _remove_aella_system_rules(self) -> None:
-        """
-        Remove AELLA-managed rules from INPUT and delete chain.
-        Used ONLY by: set acl policy (re-init).
-        """
-        # delete jump rules (may exist multiple times)
-        rc, out, _ = self._run_cmd("sudo iptables -S INPUT")
-        if rc == 0 and out:
-            for line in out.splitlines():
+        rc, output, _ = self._run_cmd(["sudo", "iptables", "-S", "INPUT"])
+        if rc == 0:
+            for line in output.splitlines():
                 if not line.startswith("-A INPUT"):
                     continue
-                if AELLA_SYSTEM_JUMP_COMMENT in line or AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT in line:
-                    del_line = line.replace("-A INPUT", "-D INPUT", 1)
-                    self._run_cmd("sudo iptables " + del_line)
-
-        # flush/delete chain
+                if AELLA_SYSTEM_JUMP_COMMENT not in line and AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT not in line:
+                    continue
+                try:
+                    tokens = shlex.split(line)
+                except ValueError:
+                    continue
+                if len(tokens) >= 2 and tokens[:2] == ["-A", "INPUT"]:
+                    tokens[0] = "-D"
+                    self._run_cmd(["sudo", "iptables"] + tokens)
         self._iptables_delete_chain(AELLA_INPUT_CHAIN)
 
-    def _build_user_rule_args(self, iface: str, iface_ip: str, action: str, source: str, port: str, desc: str) -> str:
-        """
-        Build rule args for AELLA_INPUT_CHAIN.
-        MUST include -d <iface_ip>/32 always.
-        MUST include comment with ACL_COMMENT_PREFIX.
-        """
+    def _build_user_rule_args(self, iface: str, iface_ip: str, action: str, source: str, port: str, desc: str) -> list[str]:
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", iface or ""):
+            raise ValueError("Invalid ACL interface")
+        iface_ip = str(ipaddress.IPv4Address(iface_ip))
+        if action not in {"allow", "deny"}:
+            raise ValueError("Invalid ACL action")
+        if source not in ("0.0.0.0/0", "0.0.0.0"):
+            source = str(ipaddress.ip_network(source, strict=False))
+        if port not in {"all", "icmp", "ping"}:
+            if not str(port).isdigit() or not 1 <= int(port) <= 65535:
+                raise ValueError("Invalid ACL port")
+            port = str(int(port))
         target = "ACCEPT" if action == "allow" else "DROP"
-        iface_part = f"-i {shlex.quote(iface)}"
-        dest_part = f"-d {iface_ip}/32"
-        any_source = source in ("0.0.0.0/0", "0.0.0.0")
-        comment_value = (ACL_COMMENT_PREFIX + (desc or "").strip()).strip()
-        escaped_comment = comment_value.replace('"', '\\"')
-        comment_part = f'-m comment --comment "{escaped_comment}"'
-
-        src_part = "" if any_source else f"-s {source}"
-        if port == "all":
-            proto_part = ""
-        elif port in ("icmp", "ping"):
-            proto_part = "-p icmp --icmp-type echo-request"
-        else:
-            proto_part = f"-p tcp --dport {port}"
-
-        args = " ".join(x for x in [iface_part, src_part, dest_part, proto_part, "-j " + target, comment_part] if x).strip()
+        comment_value = ACL_COMMENT_PREFIX + "".join(
+            ch for ch in (desc or "") if ch.isprintable()
+        )[:180]
+        args = ["-i", iface]
+        if source not in ("0.0.0.0/0", "0.0.0.0"):
+            args.extend(["-s", source])
+        args.extend(["-d", "{}/32".format(iface_ip)])
+        if port in {"icmp", "ping"}:
+            args.extend(["-p", "icmp", "--icmp-type", "echo-request"])
+        elif port != "all":
+            args.extend(["-p", "tcp", "--dport", port])
+        args.extend(["-j", target, "-m", "comment", "--comment", comment_value])
         return args
 
     def _normalize_acl_source(self, source: str | None) -> str | None:
@@ -3244,138 +3202,24 @@ class AellaCli(cmd.Cmd, object):
         )
 
     def _ensure_default_tail_rule_last(self, mode: str, iface_ip: str) -> None:
-        # remove existing default tail first (both types), then append correct one
-        rc, out, _ = self._run_cmd(f"sudo iptables -S {AELLA_INPUT_CHAIN}")
-        if rc == 0 and out:
-            for line in out.splitlines():
-                if not line.startswith(f"-A {AELLA_INPUT_CHAIN}"):
-                    continue
-                if AELLA_DEFAULT_WHITELIST_COMMENT in line or AELLA_DEFAULT_BLACKLIST_COMMENT in line:
-                    del_line = line.replace(f"-A {AELLA_INPUT_CHAIN}", f"-D {AELLA_INPUT_CHAIN}", 1)
-                    self._run_cmd("sudo iptables " + del_line)
-
+        iface_ip = str(ipaddress.IPv4Address(iface_ip))
+        _, parsed = self.parse_chain_rules(AELLA_INPUT_CHAIN)
+        for rule in parsed:
+            if self._comment_is_default_tail(rule.get("comment")):
+                self._delete_chain_rule_line(rule["raw"])
         if mode == "whitelist":
-            tail_args = f'-d {iface_ip}/32 -j DROP -m comment --comment "{AELLA_DEFAULT_WHITELIST_COMMENT}"'
+            target = "DROP"
+            comment = AELLA_DEFAULT_WHITELIST_COMMENT
+        elif mode == "blacklist":
+            target = "ACCEPT"
+            comment = AELLA_DEFAULT_BLACKLIST_COMMENT
         else:
-            tail_args = f'-d {iface_ip}/32 -j ACCEPT -m comment --comment "{AELLA_DEFAULT_BLACKLIST_COMMENT}"'
-
-        # append only if not exists
-        if not self._iptables_rule_check(AELLA_INPUT_CHAIN, tail_args):
-            self._iptables_rule_insert(AELLA_INPUT_CHAIN, None, tail_args)
-
-    def _detect_ssh_client_ip(self) -> str | None:
-        return self._get_current_ssh_client_ip()
-
-    def _client_ip_in_cidr(self, client_ip: str, cidr: str) -> bool:
-        try:
-            ip_obj = ipaddress.ip_address(client_ip)
-            net_obj = ipaddress.ip_network(cidr, strict=False)
-            return ip_obj in net_obj
-        except Exception:
-            return False
-
-    def _compute_whitelist_ssh_risk(self, client_ip: str | None, staged_rules: list[dict]) -> tuple[str, str]:
-        """
-        Returns (risk_level, message).
-        HIGH if cannot prove client_ip has allow rule for tcp/22 or all.
-        """
-        if not client_ip:
-            return ("HIGH", "Unable to detect current SSH client IP. Applying ACL may terminate your session and block future access.")
-
-        # Need a rule that allows client_ip and includes port 22 or all.
-        for r in staged_rules:
-            if r.get("action") != "allow":
-                continue
-            src = r.get("source", "0.0.0.0/0")
-            ports = r.get("ports", [])
-            if not ports:
-                continue
-            if not ("all" in ports or "22" in ports):
-                continue
-            # Match source
-            if src in ("0.0.0.0/0", "0.0.0.0"):
-                # allow any -> safe for ssh
-                return ("LOW", f"Current SSH client IP {client_ip} will be allowed (0.0.0.0/0 includes SSH).")
-            if "/" in src:
-                if self._client_ip_in_cidr(client_ip, src):
-                    return ("LOW", f"Current SSH client IP {client_ip} is included in allow CIDR {src} for SSH.")
-            else:
-                if client_ip == src:
-                    return ("LOW", f"Current SSH client IP {client_ip} is explicitly allowed for SSH.")
-        return ("HIGH", f"Your current SSH client IP {client_ip} is NOT allowed for SSH(22). Applying may terminate your session and lock you out.")
-
-    def _confirm_yes(self, prompt: str) -> bool:
-        val = input(prompt).strip()
-        return val == "YES"
-
-    def _clear_acl_staging(self):
-        """Clear staged ACL rules"""
-        self._save_acl_staging({"rules": []})
-
-    def _persist_iptables_rules(self) -> bool:
-        """Persist current iptables rules so they survive reboot.
-
-        Preferred: netfilter-persistent save
-        Fallback : iptables-save > /etc/iptables/rules.v4
-        """
-        try:
-            # 0) Persist ipset (required before iptables-restore on boot)
-            if shutil.which("ipset"):
-                p = subprocess.run(
-                    ["sudo", "sh", "-c", "ipset save > /etc/ipset.conf"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=False,
-                )
-                if p.returncode != 0:
-                    warn = (p.stderr or p.stdout or "").strip()
-                    print(f"[WARN] ipset save failed: {warn}")
-                if shutil.which("systemctl"):
-                    svc = subprocess.run(
-                        ["sudo", "systemctl", "enable", "--now", "ipset-persistent"],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        check=False,
-                    )
-                    if svc.returncode != 0:
-                        warn = (svc.stderr or svc.stdout or "").strip()
-                        print(f"[WARN] ipset-persistent service enable failed: {warn}")
-
-            # 1) Preferred path (Ubuntu standard)
-            if shutil.which("netfilter-persistent"):
-                p = subprocess.run(
-                    ["sudo", "netfilter-persistent", "save"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=False,
-                )
-                if p.returncode == 0:
-                    return True
-                warn = (p.stderr or p.stdout or "").strip()
-                print(f"[WARN] netfilter-persistent save failed: {warn}")
-
-            # 2) Fallback path
-            if shutil.which("iptables-save"):
-                p = subprocess.run(
-                    ["sudo", "sh", "-c", "iptables-save > /etc/iptables/rules.v4"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=False,
-                )
-                if p.returncode == 0:
-                    return True
-                warn = (p.stderr or p.stdout or "").strip()
-                print(f"[WARN] iptables-save fallback failed: {warn}")
-
-            print("[WARN] Unable to persist iptables rules (netfilter-persistent/iptables-save not found).")
-            return False
-        except Exception as e:
-            print(f"[WARN] Persist iptables rules failed: {e}")
-            return False
+            raise ValueError("Invalid ACL mode")
+        self._run_iptables(
+            ["-A", AELLA_INPUT_CHAIN, "-d", "{}/32".format(iface_ip),
+             "-j", target, "-m", "comment", "--comment", comment],
+            "Failed to ensure default ACL rule",
+        )
 
     def _stage_rule(self, action, source, ports, desc):
         """Stage a rule in ACL staging file, avoid duplicates"""
@@ -3396,96 +3240,78 @@ class AellaCli(cmd.Cmd, object):
         return True
 
     def _iptables_add(self, action, source, ports, desc, dest_ip=None):
-        """Add ACL rules to iptables with comment prefix"""
+        if action not in {"allow", "deny"}:
+            raise ValueError("Invalid ACL action")
         if not dest_ip:
             dest_ip = self._get_mgt_ipv4()
-        dest_part = "-d {}/32".format(dest_ip)
-        comment_value = ACL_COMMENT_PREFIX + (desc or "").strip()
-        escaped_comment = comment_value.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
-        comment_part = '-m comment --comment "{}"'.format(escaped_comment)
-        any_source = source in ("0.0.0.0/0", "0.0.0.0")
-
+        dest_ip = str(ipaddress.IPv4Address(dest_ip))
+        if source not in ("0.0.0.0/0", "0.0.0.0"):
+            source = str(ipaddress.ip_network(source, strict=False))
+        target = "ACCEPT" if action == "allow" else "DROP"
+        comment_value = ACL_COMMENT_PREFIX + "".join(ch for ch in (desc or "") if ch.isprintable())[:180]
         for port in ports:
-            if self._iptables_rule_exists(action, source, port, dest_ip=dest_ip):
-                continue
-            if port == 'all':
-                if action == 'allow':
-                    if any_source:
-                        cmd = "sudo iptables -I INPUT {} {} -j ACCEPT".format(dest_part, comment_part).strip()
-                    else:
-                        cmd = "sudo iptables -I INPUT -s {} {} {} -j ACCEPT".format(source, dest_part, comment_part).strip()
+            args = ["sudo", "iptables", "-I", "INPUT"]
+            if source not in ("0.0.0.0/0", "0.0.0.0"):
+                args.extend(["-s", source])
+            args.extend(["-d", "{}/32".format(dest_ip)])
+            if port != "all":
+                if str(port) in {"icmp", "ping"}:
+                    args.extend(["-p", "icmp"])
+                elif str(port).isdigit() and 1 <= int(port) <= 65535:
+                    args.extend(["-p", "tcp", "--dport", str(int(port))])
                 else:
-                    if any_source:
-                        cmd = "sudo iptables -I INPUT {} {} -j DROP".format(dest_part, comment_part).strip()
-                    else:
-                        cmd = "sudo iptables -I INPUT -s {} {} {} -j DROP".format(source, dest_part, comment_part).strip()
-            else:
-                if action == 'allow':
-                    if any_source:
-                        cmd = "sudo iptables -I INPUT -p tcp --dport {} {} {} -j ACCEPT".format(port, dest_part, comment_part).strip()
-                    else:
-                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} {} -j ACCEPT".format(source, port, dest_part, comment_part).strip()
-                else:
-                    if any_source:
-                        cmd = "sudo iptables -I INPUT -p tcp --dport {} {} {} -j DROP".format(port, dest_part, comment_part).strip()
-                    else:
-                        cmd = "sudo iptables -I INPUT -s {} -p tcp --dport {} {} {} -j DROP".format(source, port, dest_part, comment_part).strip()
-
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, err = proc.communicate()
-            if proc.returncode != 0:
-                error_msg = err.decode('utf-8', errors='ignore') if err else 'Unknown error'
-                if 'comment' in error_msg.lower() or 'match' in error_msg.lower():
-                    cmd_no_comment = cmd.replace(comment_part, '').replace('  ', ' ').strip()
-                    subprocess.Popen(cmd_no_comment, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+                    raise ValueError("Invalid ACL port")
+            args.extend(["-m", "comment", "--comment", comment_value, "-j", target])
+            subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
 
     def _iptables_rule_exists(self, action, source, port, dest_ip=None):
-        """Check if a semantically equivalent rule already exists via iptables -C"""
-        target = "ACCEPT" if action == "allow" else "DROP"
-        any_source = source in ("0.0.0.0/0", "0.0.0.0")
+        if action not in {"allow", "deny"}:
+            return False
         if not dest_ip:
             dest_ip = self._get_mgt_ipv4()
-        dest_part = "-d {}/32".format(dest_ip)
-
-        base_parts = ["sudo iptables -C INPUT", dest_part]
+        try:
+            dest_ip = str(ipaddress.IPv4Address(dest_ip))
+            if source not in ("0.0.0.0/0", "0.0.0.0"):
+                source = str(ipaddress.ip_network(source, strict=False))
+        except ValueError:
+            return False
+        target = "ACCEPT" if action == "allow" else "DROP"
+        args = ["sudo", "iptables", "-C", "INPUT", "-d", "{}/32".format(dest_ip)]
         if port != "all":
-            base_parts.append("-p tcp --dport {}".format(port))
-        base_parts.append("-j {}".format(target))
-        base_cmd = " ".join(base_parts)
-
-        if not any_source:
-            check_cmd = "{} -s {}".format(base_cmd, source)
-            proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            proc.communicate()
-            return proc.returncode == 0
-
-        check_cmds = [
-            "{} -s 0.0.0.0/0".format(base_cmd),
-            base_cmd,
-        ]
-        for check_cmd in check_cmds:
-            proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            proc.communicate()
-            if proc.returncode == 0:
-                return True
-        return False
+            if str(port) in {"icmp", "ping"}:
+                args.extend(["-p", "icmp"])
+            elif str(port).isdigit() and 1 <= int(port) <= 65535:
+                args.extend(["-p", "tcp", "--dport", str(int(port))])
+            else:
+                return False
+        args.extend(["-j", target])
+        if source not in ("0.0.0.0/0", "0.0.0.0"):
+            args.extend(["-s", source])
+        proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        return proc.returncode == 0
 
     def _iptables_delete_user_rules(self):
-        """Delete user ACL rules with AELLA_ACL prefix from INPUT chain"""
-        cmd = "sudo iptables -S INPUT"
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, _ = proc.communicate()
-        if proc.returncode != 0 or not out:
+        proc = subprocess.run(
+            ["sudo", "iptables", "-S", "INPUT"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        if proc.returncode != 0:
             return
-
-        lines = out.decode('utf-8', errors='ignore').split('\n')
-        for line in lines:
+        for line in proc.stdout.splitlines():
             if not line.startswith("-A INPUT"):
                 continue
-            if not self._is_user_acl_rule_line(line):
+            try:
+                tokens = shlex.split(line)
+            except ValueError:
                 continue
-            del_cmd = "sudo iptables " + line.replace("-A INPUT", "-D INPUT", 1)
-            subprocess.Popen(del_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+            if not any(token.startswith(ACL_COMMENT_PREFIX.strip()) for token in tokens):
+                continue
+            if tokens[:2] == ["-A", "INPUT"]:
+                tokens[0] = "-D"
+                subprocess.run(
+                    ["sudo", "iptables"] + tokens,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                )
 
     def set_acl_callback(self, key, param):
         """
