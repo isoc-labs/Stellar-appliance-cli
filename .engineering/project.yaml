@@ -21,11 +21,11 @@ operations:
   production_oriented: true
   runbook_required: true
   incident_response_required: true
-  persistent_state: false
+  persistent_state: true
   runbook_paths:
   - docs/OPERATIONS_RUNBOOK.md
   health_command: bash -lc "printf 'show version\nshow hostname\nquit\n' | aella_cli"
-  backup_command: ''
-  restore_test_command: ''
+  backup_command: "tar -C /var/lib -czf /root/aella-cli-state.tgz aella"
+  restore_test_command: "tar -tzf /root/aella-cli-state.tgz >/dev/null"
   upgrade_command: ''
   rollback_command: ''

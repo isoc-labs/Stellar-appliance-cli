@@ -77,6 +77,8 @@ Main command families:
 | `shutdown` | Shut down a system or service |
 | `console` | Open a VM console |
 | `monitor` | Monitor VM/system state |
+| `shell` | Enter the root maintenance shell after account-password authentication |
+| `!<command>` | Run a restricted diagnostic command from the explicit allowlist |
 | `help` | Display command help |
 | `quit` | Exit |
 
@@ -189,18 +191,27 @@ show autostart
 set autostart <vm> [enable|disable]
 monitor
 show patch_history
-set patches <patch_file>
+set patches apply <approved_patch_name>
 ```
 
 Available VM names depend on the deployed appliance topology.
 
-## Operational notes
+## Restricted SSH and shell security
+
+The installed `stellar` account is not a general-purpose Linux account:
+
+- SSH sessions are forced into the Appliance CLI. Remote commands, SFTP/SCP, and SSH forwarding are disabled.
+- `shell` accepts no arguments and opens the root maintenance Bash only after validating the invoking `stellar` account password.
+- `!<command>` is not a shell escape. It accepts only the diagnostic allowlist: `ping`, `tcpdump`, `traceroute`, `ifconfig`, `iptables`, `dmesg`, `ip`, `dig`, `htop`, and `top`. Each command has an argument policy; mutating operations and shell-capable options are rejected.
+- The `stellar` sudo rule permits only a no-argument invocation of the root-owned CLI. The account is removed from privileged groups.
+- Direct arbitrary apt package installation is disabled. Only named Stellar hotfix packages can be applied through `set patches apply`.
+
 
 - Use console or out-of-band access before making remote network changes that could cut connectivity.
 - Network configuration follows the installer-managed ifupdown model.
 - NTP commands require NTPsec.
 - ACL changes are staged and must be explicitly applied.
-- System-changing commands generally require root/sudo privileges.
+- Privileged system operations are exposed through the root-run Appliance CLI; the `stellar` account does not receive general sudo or Linux shell access.
 
 ## Documentation
 
