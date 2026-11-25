@@ -1020,7 +1020,6 @@ class AellaCli(cmd.Cmd, object):
             print("Command failed: {}".format(exc))
 
     @staticmethod
-    def show_cmd_default_callback    @staticmethod
     def show_cmd_default_callback(key, param):
         if key:
             return None 
@@ -5492,13 +5491,6 @@ class AellaCli(cmd.Cmd, object):
             else:
                 print("{}".format(output))
         return proc.returncode == 0
-
-    def system_is_container(self):
-        try:
-            cgroup = Path("/proc/1/cgroup").read_text(encoding="utf-8", errors="ignore")
-            return "docker" in cgroup or "kubepods" in cgroup
-        except OSError:
-            return False
 
     def system_is_container(self):
         try:
