@@ -1,6 +1,8 @@
+import ast
 import cmd
 import inspect
 import io
+import textwrap
 import unittest
 from unittest.mock import Mock, patch
 
@@ -26,6 +28,26 @@ class DiagnosticCommandPolicyTests(unittest.TestCase):
 
     def test_allowlist_contains_only_expected_diagnostics(self):
         self.assertEqual(set(self.cli.shell_command), ALLOWED_COMMANDS)
+
+    def test_production_constructor_uses_exact_allowlist(self):
+        source = textwrap.dedent(inspect.getsource(module.AellaCli.__init__))
+        tree = ast.parse(source)
+        actual = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Attribute) and target.attr == "shell_command"
+                for target in node.targets
+            ):
+                actual = ast.literal_eval(node.value)
+                break
+        self.assertIsNotNone(actual)
+        self.assertEqual(set(actual), ALLOWED_COMMANDS)
+
+    def test_appliance_cli_contains_no_shell_execution_primitives(self):
+        source = inspect.getsource(module.AellaCli)
+        self.assertNotIn("shell=True", source)
+        self.assertNotIn("os.system(", source)
+        self.assertNotIn("os.popen(", source)
 
     def test_bang_is_parsed_as_separate_command(self):
         command, args, original = self.cli.parseline("!ip -br addr")
