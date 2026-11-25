@@ -23,6 +23,8 @@ import sys
 import cmd
 import pwd
 import functools
+import grp
+import stat
 
 try:
     import readline
@@ -196,6 +198,85 @@ def _atomic_replace_text_file(path, text):
             except FileNotFoundError:
                 pass
 
+
+
+def _syslog_gid():
+    try:
+        return grp.getgrnam("syslog").gr_gid
+    except KeyError:
+        return 0
+
+
+def _ensure_root_owned_directory(path, group_name="syslog", mode=0o750):
+    """Create a directory without following symlinks, then enforce root ownership."""
+    if os.geteuid() != 0:
+        raise PermissionError("Root privileges are required to secure {}".format(path))
+    target = Path(path)
+    if not target.is_absolute():
+        raise ValueError("Security-sensitive directory must be absolute: {}".format(path))
+
+    current = Path("/")
+    for component in target.parts[1:]:
+        current = current / component
+        if os.path.lexists(current):
+            current_stat = os.lstat(current)
+            if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISDIR(current_stat.st_mode):
+                raise RuntimeError("Refusing unsafe directory component: {}".format(current))
+        else:
+            os.mkdir(current, 0o755 if current.parent == Path("/") else 0o750)
+
+    try:
+        gid = grp.getgrnam(group_name).gr_gid
+    except KeyError:
+        gid = 0
+    os.chown(str(target), 0, gid)
+    os.chmod(str(target), mode)
+    return gid
+
+
+def _secure_existing_log_files(directory, prefix, gid):
+    """Remove planted links/special files and secure existing CLI log files."""
+    for entry in os.scandir(directory):
+        if not entry.name.startswith(prefix):
+            continue
+        entry_stat = entry.stat(follow_symlinks=False)
+        if not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_nlink != 1:
+            os.unlink(entry.path)
+            continue
+        os.chown(entry.path, 0, gid)
+        os.chmod(entry.path, 0o640)
+
+
+def _ensure_patch_storage():
+    _ensure_root_owned_directory("/var/lib/aella", mode=0o750)
+    _ensure_root_owned_directory(PATCH_DIR, mode=0o750)
+    _ensure_root_owned_directory(PATCH_LOG_DIR, mode=0o750)
+
+
+def _read_root_text_file(path):
+    """Read a root-owned regular file without following a symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(os.fspath(path), flags)
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1 or file_stat.st_uid != 0:
+            raise RuntimeError("Refusing unsafe state file: {}".format(path))
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            fd = -1
+            return stream.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _write_root_text_file(path, content, mode=0o640):
+    path = Path(path)
+    _ensure_root_owned_directory(str(path.parent), mode=0o750)
+    _atomic_replace_text_file(str(path), content)
+    os.chown(str(path), 0, _syslog_gid())
+    os.chmod(str(path), mode)
+
+
 # Timezone constants
 try:
     from zoneinfo import available_timezones
@@ -204,7 +285,7 @@ except Exception:
     ALL_TIMEZONES = frozenset()
 
 # Logging utilities
-LOG_DIR = "/var/log/aella"
+LOG_DIR = "/var/log/aella" if os.geteuid() == 0 else tempfile.mkdtemp(prefix="aella_cli_test_")
 ACL_STAGING_PATH = "/var/lib/aella/acl_staging.json"
 ACL_STATE_PATH = "/var/lib/aella/acl_state.json"
 ACL_COMMENT_PREFIX = "AELLA_ACL "
@@ -318,8 +399,23 @@ def ensure_file(file_path, root=False, owner=None):
 
 class RotatingFileHandler(logging.handlers.RotatingFileHandler):
     def __init__(self, filename, *args, **kwargs):
-        make_dir(os.path.dirname(filename), group="syslog")
+        directory = os.path.dirname(filename)
+        if os.geteuid() == 0:
+            gid = _ensure_root_owned_directory(directory, mode=0o750)
+            _secure_existing_log_files(directory, os.path.basename(filename), gid)
+        else:
+            directory_path = Path(directory)
+            if os.path.lexists(directory_path):
+                directory_stat = os.lstat(directory_path)
+                if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
+                    raise RuntimeError("Refusing unsafe log directory: {}".format(directory))
+            else:
+                directory_path.mkdir(parents=True, mode=0o700)
+            os.chmod(directory, 0o700)
         super(RotatingFileHandler, self).__init__(filename, *args, **kwargs)
+        if os.geteuid() == 0:
+            os.chown(filename, 0, _syslog_gid())
+            os.chmod(filename, 0o640)
 
 
 def get_logger(log_name):
@@ -355,7 +451,7 @@ META_USER = "AellaMeta"
 
 META_TOKEN = "WroTQfm/W6x10"
 
-PATCH_DIR = "/home/stellar/hotfix"
+PATCH_DIR = "/var/lib/aella/hotfix"
 PATCH_LOG_DIR = "{}/logs".format(PATCH_DIR)
 PATCH_HISTORY = "{}/hotfix-history".format(PATCH_DIR)
 
@@ -719,17 +815,40 @@ class AellaCli(cmd.Cmd, object):
                 print('Type "help" to see available commands.')
                 print('')
 
-    # Shell command
+    def parseline(self, line):
+        stripped = line.lstrip()
+        if stripped.startswith("!"):
+            return "bang", stripped[1:].strip(), line
+        return super(AellaCli, self).parseline(line)
+
+    def _resolve_shell_command(self, command):
+        if command not in self.shell_command:
+            return None
+        executable = shutil.which(command, path="/usr/sbin:/usr/bin:/sbin:/bin")
+        if not executable:
+            return None
+        resolved = os.path.realpath(executable)
+        if not any(resolved.startswith(prefix) for prefix in ("/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/")):
+            return None
+        try:
+            executable_stat = os.stat(resolved)
+        except OSError:
+            return None
+        if (
+            not stat.S_ISREG(executable_stat.st_mode)
+            or executable_stat.st_uid != 0
+            or executable_stat.st_mode & 0o022
+        ):
+            return None
+        return resolved
+
     def _is_safe_shell_diagnostic(self, tokens):
-        """Allow diagnostic commands without exposing root command execution."""
-        if not tokens:
+        """Fail-closed argument policy for the explicitly allowed diagnostic tools."""
+        if not tokens or tokens[0] not in self.shell_command:
             return False
         command, args = tokens[0], tokens[1:]
 
         if command == "ip":
-            # ip netns exec launches an arbitrary program with the CLI's root
-            # privileges. Only read-only address/link/route/neighbour queries
-            # are available without the authenticated maintenance shell.
             allowed_flags = {
                 "-4", "-6", "-br", "-brief", "-s", "-stats", "-d",
                 "-details", "-o", "-oneline", "-r", "-resolve", "-numeric",
@@ -754,31 +873,28 @@ class AellaCli(cmd.Cmd, object):
                 return False
             if not remaining:
                 return True
-            if remaining[0] in {"show", "list"}:
-                return True
-            return object_name == "route" and remaining[0] == "get"
+            return remaining[0] in {"show", "list"} or (
+                object_name == "route" and remaining[0] == "get"
+            )
 
         if command == "tcpdump":
-            # tcpdump -z executes a post-rotation command as the CLI user;
-            # -w can overwrite arbitrary files because this CLI runs as root.
             return not any(
                 token in {"-z", "-w", "--postrotate-command", "--write"}
-                or token.startswith("-z") or token.startswith("-w")
+                or token.startswith(("-z", "-w"))
                 for token in args
             )
 
         if command == "dmesg":
-            # Keep kernel-log inspection, but do not let the diagnostic path
-            # clear the ring buffer or alter console logging policy.
             return not any(
-                token in {"-c", "--read-clear", "-C", "--clear", "-n", "--console-level"}
+                token in {
+                    "-c", "--read-clear", "-C", "--clear", "-n",
+                    "--console-level", "-D", "-E",
+                }
                 or token.startswith("--console-level=")
                 for token in args
             )
 
         if command == "iptables":
-            # Raw firewall changes bypass the staged ACL workflow. Keep only
-            # list/rule-inspection operations on the unauthenticated path.
             tables = {"filter", "nat", "mangle", "raw", "security"}
             read_only_flags = {
                 "-n", "--numeric", "-v", "--verbose", "-x", "--exact",
@@ -803,49 +919,108 @@ class AellaCli(cmd.Cmd, object):
             return True
 
         if command == "ifconfig":
-            # ifconfig with no argument or one interface is read-only; options
-            # such as up/down/netmask can change host networking.
             return len(args) <= 1 and (
-                not args or args == ["-a"] or
-                re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", args[0]) is not None
+                not args or args == ["-a"]
+                or re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", args[0]) is not None
             )
 
         if command == "top":
-            # Interactive top supports a shell-command escape. Batch mode does not.
-            return "-b" in args
+            if "-n" in args:
+                index = args.index("-n")
+                if index + 1 >= len(args) or not args[index + 1].isdigit():
+                    return False
+                if not 1 <= int(args[index + 1]) <= 10:
+                    return False
+            return True
 
-        return True
+        if command == "ping":
+            for index, token in enumerate(args):
+                if token in {"-f", "--flood", "-l", "--preload"} or token.startswith("--flood="):
+                    return False
+                if token in {"-c", "--count"}:
+                    if index + 1 >= len(args) or not args[index + 1].isdigit():
+                        return False
+                    if not 1 <= int(args[index + 1]) <= 20:
+                        return False
+                if token.startswith("-c") and token[2:].isdigit():
+                    if not 1 <= int(token[2:]) <= 20:
+                        return False
+            return True
+
+        if command in {"traceroute", "dig", "htop"}:
+            return True
+
+        return False
 
     @log_cmd
     def do_shell(self, line):
-        """Shell command"""
+        """Enter the maintenance shell only after authenticating the invoking account."""
+        if line.strip():
+            print("The 'shell' command does not accept arguments. Use !<allowed-command> for diagnostics.")
+            return
+        if not self.is_password_valid():
+            print("Authentication failed. Use 'set password' to set your account password.")
+            return
         try:
-            tokens = shlex.split(line) if line else []
+            subprocess.call(["/bin/bash", "--login"], cwd="/root", shell=False)
+        except Exception as exc:
+            print("Failed to start maintenance shell: {}".format(exc))
+
+    @log_cmd
+    def do_bang(self, line):
+        """Run one explicitly allowlisted diagnostic command without a shell."""
+        try:
+            tokens = shlex.split(line)
         except ValueError as exc:
             print("Invalid diagnostic command: {}".format(exc))
             return
+        if not tokens or tokens[0] not in self.shell_command:
+            print("Command is not in the diagnostic allowlist.")
+            return
+        if not self._is_safe_shell_diagnostic(tokens):
+            print("Command or arguments are restricted on the diagnostic path.")
+            return
 
-        key = tokens[0] if tokens else ""
-        if not key:
-            if self.is_password_valid():
-                subprocess.call(["/usr/bin/sudo", "bash", "-lc", "cd /root && exec bash"])
+        executable = self._resolve_shell_command(tokens[0])
+        if not executable:
+            print("Allowed diagnostic command is not installed or is not a trusted system binary.")
+            return
+
+        command = tokens[0]
+        args = tokens[1:]
+        if command == "top":
+            if not args:
+                args = ["-b", "-n", "1"]
+            elif "-b" not in args:
+                args = ["-b", "-n", "1"] + args
+            elif "-n" not in args:
+                args.extend(["-n", "1"])
+
+        user_scoped = {"ping", "traceroute", "dig", "htop", "top"}
+        if command in user_scoped:
+            username = _get_invoking_username()
+            if not username:
+                print("Unable to resolve the authenticated invoking account; command denied.")
+                return
+            if username != "root":
+                argv = ["/usr/bin/sudo", "-u", username, "--", executable] + args
             else:
-                print("Authentication failed. Use 'set password' to set your account password.")
-        elif key in self.shell_command:
-            # Prevent displaying aella_cli content.
-            if "cli" in line:
-                return
-            if not self._is_safe_shell_diagnostic(tokens):
-                print("Command is restricted on the unauthenticated diagnostic path. Use 'shell' for maintenance access.")
-                return
-            if key in {"tcpdump", "iptables"}:
-                tokens.insert(0, "sudo")
-            try:
-                subprocess.call(tokens, shell=False)
-            except Exception as exc:
-                print("Command failed {}".format(exc))
+                argv = [executable] + args
+        else:
+            argv = [executable] + args
+
+        env = {
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "TERM": os.environ.get("TERM", "xterm"),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
+        try:
+            subprocess.call(argv, shell=False, env=env)
+        except Exception as exc:
+            print("Command failed: {}".format(exc))
 
     @staticmethod
+    def show_cmd_default_callback    @staticmethod
     def show_cmd_default_callback(key, param):
         if key:
             return None 
