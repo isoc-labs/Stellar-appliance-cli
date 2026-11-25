@@ -3090,83 +3090,64 @@ class AellaCli(cmd.Cmd, object):
         _write_root_text_file(log_file, log_content)
 
     def set_patches_callback(self, key, param):
+        """Apply only operator-approved Stellar hotfix packages."""
         if not param or param[0].endswith("?"):
-            print('\n<String> \t Specify patches string, use "set patch apply <patch_name>" to apply patch from StellarCyber\n')
+            print('\nUse: set patches apply <approved_patch_name>\n')
+            return
+        if param[0] != "apply":
+            print("Direct OS package installation is disabled in the restricted Appliance CLI.")
+            print("Use 'set patches apply <approved_patch_name>' for an operator-approved Stellar hotfix.")
+            return
+        if len(param) != 2:
+            print('\nUse: set patches apply <approved_patch_name>\n')
+            return
+
+        patch_name = param[1]
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", patch_name) or ".." in patch_name:
+            print("Invalid patch name. Directory components and special characters are not allowed.")
             return
 
         try:
-            if param[0] == "apply":
-                if len(param) != 2 or param[1] == "?":
-                    print('\n<String> \t Specify the Stellar patch name to apply\n')
-                    return
-                patch_name = param[1]
-                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", patch_name) or ".." in patch_name:
-                    print("Invalid patch name. Use a file name without directory components.")
-                    return
-
-                _ensure_patch_storage()
-                log_file = os.path.join(PATCH_LOG_DIR, "{}.log".format(patch_name))
-                local_file = os.path.join(PATCH_DIR, patch_name)
-                try:
-                    patch_history = json.loads(_read_root_text_file(PATCH_HISTORY))
-                    if not isinstance(patch_history, dict):
-                        patch_history = {}
-                except Exception:
+            _ensure_patch_storage()
+            log_file = os.path.join(PATCH_LOG_DIR, "{}.log".format(patch_name))
+            local_file = os.path.join(PATCH_DIR, patch_name)
+            try:
+                patch_history = json.loads(_read_root_text_file(PATCH_HISTORY))
+                if not isinstance(patch_history, dict):
                     patch_history = {}
+            except Exception:
+                patch_history = {}
 
-                # Never let wget follow a pre-existing symlink or hard link.
-                if os.path.lexists(local_file):
-                    local_stat = os.lstat(local_file)
-                    if stat.S_ISDIR(local_stat.st_mode):
-                        print("Refusing unsafe patch target path.")
-                        return
-                    os.unlink(local_file)
-
-                url = "https://192.168.122.2:8443/hotfix/{}".format(patch_name)
-                download_cmd = [
-                    "wget", "--user={}".format(META_USER),
-                    "--password={}".format(META_TOKEN), "-O",
-                    local_file, "--no-check-certificate", url,
-                ]
-                res, msg = self.run_command_with_stderr(download_cmd)
-                if not res:
-                    message = msg.decode("utf-8", errors="replace").strip() if isinstance(msg, bytes) else str(msg)
-                    error_msg = "Failed to download patch: {}".format(message)
-                    print(error_msg)
-                    self.update_patch_history(patch_name, patch_history, log_file, False, error_msg)
+            # Remove any pre-existing file/link before wget creates the target.
+            if os.path.lexists(local_file):
+                local_stat = os.lstat(local_file)
+                if stat.S_ISDIR(local_stat.st_mode):
+                    print("Refusing unsafe patch target path.")
                     return
+                os.unlink(local_file)
 
-                success, msg = self.run_command_with_stderr(["dpkg", "-i", local_file])
-                if success:
-                    msg = "Success"
-                elif isinstance(msg, bytes):
-                    msg = msg.decode("utf-8", errors="replace").strip()
-                self.update_patch_history(patch_name, patch_history, log_file, success, msg)
-                print(msg)
-            else:
-                package_specs = param
-                package_pattern = re.compile(
-                    r"^[a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?(?:=[A-Za-z0-9.+:~_-]+)?$"
-                )
-                if len(package_specs) > 32 or any(not package_pattern.fullmatch(item) for item in package_specs):
-                    print("Invalid package specification. Provide package names or package=version values only.")
-                    return
+            url = "https://192.168.122.2:8443/hotfix/{}".format(patch_name)
+            download_cmd = [
+                "wget", "--user={}".format(META_USER),
+                "--password={}".format(META_TOKEN), "-O",
+                local_file, "--no-check-certificate", url,
+            ]
+            downloaded, output = self.run_command_with_stderr(download_cmd)
+            if not downloaded:
+                message = output.decode("utf-8", errors="replace").strip() if isinstance(output, bytes) else str(output)
+                error_msg = "Failed to download patch: {}".format(message)
+                print(error_msg)
+                self.update_patch_history(patch_name, patch_history, log_file, False, error_msg)
+                return
 
-                print("Applying updates...")
-                commands = [
-                    ["apt", "-qq", "update"],
-                    ["apt", "-qqy", "install", *package_specs],
-                    ["apt", "clean"],
-                ]
-                for command in commands:
-                    success, output = self.run_command_with_stderr(command)
-                    if not success:
-                        message = output.decode("utf-8", errors="replace").strip() if isinstance(output, bytes) else str(output)
-                        print("Failed to run {}: {}".format(command[1], message))
-                        return
-                print("Successfully applied updates")
+            success, output = self.run_command_with_stderr(["dpkg", "-i", local_file])
+            message = "Success" if success else (
+                output.decode("utf-8", errors="replace").strip() if isinstance(output, bytes) else str(output)
+            )
+            self.update_patch_history(patch_name, patch_history, log_file, success, message)
+            print(message)
         except Exception as exc:
-            print("Failed to apply updates {}".format(exc))
+            print("Failed to apply Stellar hotfix: {}".format(exc))
 
     def set_autostart_callback(self, key, param):
         """Configure VM auto start."""
