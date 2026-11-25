@@ -1501,16 +1501,16 @@ class AellaCli(cmd.Cmd, object):
         return 0, output
 
     def is_sensor_host_mode(self):
-        """Detect whether this host is a Sensor KVM host (mds/mds2, br-data, etc.)."""
-        try:
-            if os.path.exists('/sys/class/net/br-data'):
-                return True
-            cmd = "virsh list --all --name 2>/dev/null | egrep -w 'mds|mds2' || true"
-            out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode('utf-8', errors='ignore').strip()
-            if out:
-                return True
-        except Exception:
-            pass
+        """Detect whether this host is a Sensor KVM host without invoking a shell."""
+        if os.path.exists("/sys/class/net/br-data"):
+            return True
+        proc = subprocess.run(
+            ["virsh", "list", "--all", "--name"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False,
+        )
+        if proc.returncode == 0:
+            return any(re.search(r"\b(?:mds|mds2)\b", name) for name in proc.stdout.splitlines())
         return False
 
     def list_host_nics(self):
@@ -1531,46 +1531,49 @@ class AellaCli(cmd.Cmd, object):
     def show_gateway_sensor(self):
         """Show gateway info for Sensor host using the main routing table."""
         try:
-            cmd = "ip route show default"
-            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-            out, err = p.communicate()
-            if out:
-                print('\nHost default gateway(s):')
-                for line in out.decode('utf-8', errors='ignore').splitlines():
-                    print('  ' + line)
-                print('')
+            proc = subprocess.run(
+                ["ip", "route", "show", "default"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                print("\nHost default gateway(s):")
+                for line in proc.stdout.splitlines():
+                    print("  " + line)
+                print("")
             else:
-                print('\nHost default gateway is not configured or applied\n')
-        except Exception as e:
-            print('Failed to get host gateway: {}'.format(e))
+                print("\nHost default gateway is not configured or applied\n")
+        except Exception as exc:
+            print("Failed to get host gateway: {}".format(exc))
 
     def show_interface_sensor(self, param):
-        """Show host NIC details for Sensor host."""
-        if len(param) == 0:
-            # concise inventory first
-            self.shell_cmd_exec('ip -br addr show')
-            print('')
+        """Show host NIC details for Sensor host using argv-only commands."""
+        if not param:
+            rc, output, _ = self._run_cmd(["ip", "-br", "addr", "show"])
+            if rc == 0:
+                print(output)
+            print("")
             return
-
-        iface = param[0].rstrip('?')
-        if iface == '?' or param[0].endswith('?'):
-            print('\n<Interface Name>  Specify an existing host interface/bridge name\n')
+        iface = param[0].rstrip("?")
+        if param[0].endswith("?") or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", iface):
+            print("\n<Interface Name>  Specify an existing host interface/bridge name\n")
             return
-
         if not self.is_device_exist(iface):
             return
-
-        self.shell_cmd_exec('sudo ifconfig {0} 2>/dev/null'.format(iface))
-        cmd = 'ip link show {0} | grep -oP "\\s+state\\s+\\K\\w+" 2>/dev/null'.format(iface)
-        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-        out, _ = p.communicate()
-        if out:
-            state = out.decode('utf-8', errors='ignore').rstrip()
-            print('Link state: {}\n'.format(state))
-        self.shell_cmd_exec('ip link show {0} 2>/dev/null'.format(iface))
-        # ethtool may fail for some virtual/bridge interfaces; ignore errors
-        self.shell_cmd_exec('ethtool {0} 2>/dev/null'.format(iface))
-        self.shell_cmd_exec('ethtool -i {0} 2>/dev/null | grep -E "^driver|^version|^firmware-version|^bus-info"'.format(iface))
+        for command in (["ifconfig", iface], ["ip", "link", "show", "dev", iface], ["ethtool", iface]):
+            rc, output, _ = self._run_cmd(command)
+            if rc == 0 and output:
+                print(output.rstrip() + "\n")
+        rc, link_output, _ = self._run_cmd(["ip", "link", "show", "dev", iface])
+        state_match = re.search(r"\bstate\s+(\w+)", link_output)
+        if state_match:
+            print("Link state: {}\n".format(state_match.group(1)))
+        rc, driver_output, _ = self._run_cmd(["ethtool", "-i", iface])
+        if rc == 0:
+            for line in driver_output.splitlines():
+                if re.match(r"^(driver|version|firmware-version|bus-info):", line):
+                    print(line)
+            print("")
 
     def set_interface_sensor(self, param):
         """Reject host network changes in Sensor bridge mode."""
@@ -1677,103 +1680,66 @@ class AellaCli(cmd.Cmd, object):
             if param[0].endswith("?"):
                 print("\nPress [Enter]\n")
                 return
-            self.shell_cmd_exec("sudo ifconfig mgt 2>/dev/null")
+            rc, output, _ = self._run_cmd(["ifconfig", "mgt"])
+            if output:
+                print(output)
             return
         if self.is_sensor_host_mode():
             self.show_interface_sensor(param)
             return
-
-        if key:
-            if len(param) == 0:
-                interface_list = os.listdir('/sys/class/net/')
-                for i in interface_list:
-                    if ('en' in i) or ('eth' in i) or ('br0-aio' in i) or ('mgt' in i) or ('mgmt' in i) or ('xmgt' in i) \
-                        or ('data1g' in i) or ('data10g' in i) or ('cltr0' in i):
-                        self.shell_cmd_exec('sudo ifconfig {0} 2>/dev/null'.format(i))
-            elif len(param) <= 2:
-                #if len(param) == 1 and (param[0].endswith('mgt?') or param[0].endswith('data1g?') or param[0].endswith('data10g?')):
-                if len(param) == 1 and re.match('mgt[?]|data1[0]?g[?]|cltr0[?]', param[0]):
-                     print('\nPress [Enter]\n')
-                     return
-                #elif len(param) == 1 and (param[0] == '?' or not (param[0] == 'mgt' or param[0] == 'data1g' or param[0] == 'data10g')):
-                elif len(param) == 1 and (param[0] == '?' or not re.match('mgt|data1[0]?g|cltr0', param[0])):
-                    print('\n<Interface Name>  Specify a supported interface name (mgt, data1g, data10g, cltr0)')
-                    print('Press [Enter]\n')
-                    return
-                elif len(param) == 1 and not self.is_device_exist(param[0]):
-                    return
-                #elif len(param) == 1 and (param[0] == 'mgt' or param[0] == 'data1g' or param[0] == 'data10g'):
-                elif len(param) == 1 and re.match('mgt|data1[0]?g|cltr0', param[0]):
-                    self.shell_cmd_exec('sudo ifconfig {0} 2>/dev/null'.format(param[0]))
-                    cmd = 'ip link show {0} | grep -oP "\s+state\s+\K\w+" 2>/dev/null'.format(param[0])
-                    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-                    res = p.communicate()
-                    if res[0]:
-                        state = res[0].decode('utf-8').rstrip()
-                        print('Link state: {}\n'.format(state))
-                    if param[0] == 'cltr0':
-                        self.shell_cmd_exec('ip link show {0}'.format(param[0]))
-                    self.shell_cmd_exec('ethtool {}'.format(param[0]))
-                    self.shell_cmd_exec('ethtool -i {} | grep -E "^driver|^version|^firmware-version|^bus-info"'.format(param[0]))
-                #elif len(param) == 2 and (param[0] == 'mgt' or param[0] == 'data1g' or param[0] == 'data10g') and param[1] == '?' :
-                elif len(param) == 2 and re.match('mgt|data1[0]?g|cltr0', param[0]) and param[1] == '?' :
-                     print('\nPress [Enter]\n')
-                     return
+        if not param:
+            for iface in os.listdir("/sys/class/net/"):
+                if re.match(r"^(en|eth|br0-aio|mgt|mgmt|xmgt|data1g|data10g|cltr0)", iface):
+                    if self.is_device_exist(iface):
+                        rc, output, _ = self._run_cmd(["ifconfig", iface])
+                        if rc == 0 and output:
+                            print(output)
+            return
+        iface = param[0].rstrip("?")
+        if param[0].endswith("?") or not re.fullmatch(r"(?:mgt|data1g|data10g|cltr0)", iface):
+            print("\n<Interface Name>  Specify a supported interface name (mgt, data1g, data10g, cltr0)")
+            print("Press [Enter]\n")
+            return
+        if len(param) > 1:
+            if len(param) == 2 and param[1] == "?":
+                print("\nPress [Enter]\n")
+            else:
+                print("Invalid interface command.")
+            return
+        if not self.is_device_exist(iface):
+            return
+        for command in (["ifconfig", iface], ["ip", "link", "show", "dev", iface], ["ethtool", iface]):
+            rc, output, _ = self._run_cmd(command)
+            if rc == 0 and output:
+                print(output.rstrip() + "\n")
+        if iface == "cltr0":
+            rc, output, _ = self._run_cmd(["ip", "link", "show", "dev", iface])
+            if output:
+                print(output.rstrip() + "\n")
+        rc, driver_output, _ = self._run_cmd(["ethtool", "-i", iface])
+        if rc == 0:
+            for line in driver_output.splitlines():
+                if re.match(r"^(driver|version|firmware-version|bus-info):", line):
+                    print(line)
+            print("")
 
     def show_route_callback(self, key, param):
-        # Show all routing tables
-        # - main : the default host routing table
-        # -    1 : the management network routing table
-        # -    2 : the data network routing table
-        try:
-            cmd_table_main = 'ip route show table main'
-            cmd_table_1 = 'ip route show table 1'
-            cmd_table_2 = 'ip route show table 2'
-
-            p = subprocess.Popen(cmd_table_main, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-            res = p.communicate()
-            if res[0]:
-                print('\n' + '-' * 87)
-                print('Main routing table')
-                print('-' * 87)
-                for i in res:
-                    print(i.decode('utf-8').rstrip())
+        """Show routing tables without a shell."""
+        for table, title in (
+            ("main", "Main routing table"),
+            ("1", "Management network routing table (table 1)"),
+            ("2", "Data network routing table (table 2)"),
+        ):
+            print("\n" + "-" * 87)
+            print(title)
+            print("-" * 87)
+            rc, output, err = self._run_cmd(["ip", "route", "show", "table", table])
+            if rc == 0 and output.strip():
+                print(output.rstrip())
             else:
-                print('-' * 87)
-                print('Main routing table')
-                print('-' * 87)
-                print('N/A')
-
-            p = subprocess.Popen(cmd_table_1, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-            res = p.communicate()
-            if res[0]:
-                print('-' * 87)
-                print('Management network routing table (table 1)')
-                print('-' * 87)
-                for i in res:
-                    print(i.decode('utf-8').rstrip())
-            else:
-                print('-' * 87)
-                print('Main routing table')
-                print('-' * 87)
-                print('N/A')
-
-            p = subprocess.Popen(cmd_table_2, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-            res = p.communicate()
-            if res[0]:
-                print('-' * 87)
-                print('Data network routing table (table 2)')
-                print('-' * 87)
-                for i in res:
-                    print(i.decode('utf-8').rstrip())
-            else:
-                print('-' * 87)
-                print('Main routing table')
-                print('-' * 87)
-                print('N/A')
-
-        except Exception as e:
-            print(e)
+                print("N/A")
+                if err.strip():
+                    print(err.strip())
 
     def show_cli_callback(self, key, param):
         last = 30
@@ -2171,831 +2137,6 @@ class AellaCli(cmd.Cmd, object):
 
     def load_acl_state(self) -> dict:
         return self._load_acl_state()
-
-    def _save_acl_state(self, data: dict) -> None:
-        """Save ACL policy state"""
-        target_dir = os.path.dirname(ACL_STATE_PATH)
-        make_dir(target_dir, root=True)
-        payload = json.dumps(data, indent=2, sort_keys=False)
-        tmp_path = "/tmp/acl_state.json"
-        try:
-            with open(tmp_path, "w") as f:
-                f.write(payload)
-            subprocess.run(
-                ["sudo", "mv", tmp_path, ACL_STATE_PATH],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-        except Exception:
-            try:
-                subprocess.run(
-                    ["sudo", "tee", ACL_STATE_PATH],
-                    input=payload,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=False,
-                )
-            except Exception:
-                pass
-
-    def save_acl_state(self, data: dict) -> None:
-        self._save_acl_state(data)
-
-    def _run_whiptail_radiolist(self, title: str, text: str, items: list[tuple[str, str, bool]]) -> Optional[str]:
-        args = ["whiptail", "--title", title, "--radiolist", text, "20", "78", str(len(items))]
-        for tag, desc, on in items:
-            args.extend([tag, desc, "ON" if on else "OFF"])
-        try:
-            proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        except FileNotFoundError:
-            return self._prompt_radiolist(title, text, items)
-        if proc.returncode != 0:
-            return None
-        if not proc.stdout:
-            return self._prompt_radiolist(title, text, items)
-        return proc.stdout.strip()
-
-    def _run_whiptail_yesno(self, title: str, text: str) -> bool:
-        args = ["whiptail", "--title", title, "--yesno", text, "20", "78"]
-        try:
-            proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        except FileNotFoundError:
-            return self._prompt_yesno(title, text)
-        return proc.returncode == 0
-
-    def _prompt_yesno(self, title: str, text: str) -> bool:
-        print("\n{}:".format(title))
-        print(text)
-        while True:
-            choice = input("Type 'yes' to continue or 'no' to cancel: ").strip().lower()
-            if choice in ("yes", "y"):
-                return True
-            if choice in ("no", "n"):
-                return False
-            print("Please enter yes or no.")
-
-    def _prompt_radiolist(self, title: str, text: str, items: list[tuple[str, str, bool]]) -> Optional[str]:
-        print("\n{}:".format(title))
-        print(text)
-        for idx, (tag, desc, _on) in enumerate(items, start=1):
-            print("  {}) {} - {}".format(idx, tag, desc))
-        while True:
-            choice = input("Select number (or press Enter to cancel): ").strip()
-            if choice == "":
-                return None
-            if not choice.isdigit():
-                print("Please enter a valid number.")
-                continue
-            index = int(choice)
-            if 1 <= index <= len(items):
-                return items[index - 1][0]
-            print("Please enter a valid number.")
-
-    def _is_iface_candidate(self, iface: str, exclude_ips: Sequence[str]) -> bool:
-        candidates = self.list_candidate_ifaces(exclude_ips=exclude_ips)
-        return any(item["iface"] == iface for item in candidates)
-
-    def _print_acl_help(self, policy_configured: bool) -> None:
-        print("ACL policy is not initialized.")
-        print("You must run 'set acl policy' before adding or applying any ACL rules.\n")
-        print('------------------------------------------------------------')
-        print('Required first step:')
-        print('  set acl policy        Initialize ACL mode (whitelist/blacklist) and target interface\n')
-        print('------------------------------------------------------------')
-        print('ACL rule syntax (available after policy is initialized):')
-        print('  set acl <IP/network> <port|icmp|ping|all> [description]\n')
-        print('  IP/network : IP address (e.g., 192.168.1.100) or network (e.g., 192.168.1.0/24)')
-        print('  port       : Port number (e.g., 22, 80, 443), "icmp"/"ping", or "all" for all ports')
-        print('               Multiple ports can be specified separated by space')
-        print('  description: Optional description/comment\n')
-        print('------------------------------------------------------------')
-        print('Apply staged rules (rules must exist):')
-        print('  set acl apply          Apply staged ACL rules (merge)')
-        print('  set acl apply --reset  Reset applied ACL rules and rebuild from staging\n')
-        print('------------------------------------------------------------')
-        print('Examples:')
-        print('  set acl policy')
-        print('  set acl 192.168.1.100 22 "Admin SSH access"')
-        print('  set acl 192.168.1.0/24 80 443 "Web servers"')
-        print('  set acl 10.0.0.0/8 all "Internal network"')
-        print('  set acl apply\n')
-
-    def _print_acl_policy_warning_only(self) -> None:
-        print("ACL policy is not configured. Run: set acl policy\n")
-
-    def _delete_acl_state_file(self) -> None:
-        try:
-            subprocess.run(["sudo", "rm", "-f", ACL_STATE_PATH], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        except Exception:
-            pass
-
-    def _clear_aella_managed_rules(self) -> None:
-        lines = self._read_chain_rule_lines("INPUT")
-        for line in lines:
-            if AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT in line or "-j {}".format(AELLA_INPUT_CHAIN) in line:
-                self._delete_chain_rule_line(line)
-
-        if subprocess.run(["sudo", "iptables", "-S", AELLA_INPUT_CHAIN], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).returncode == 0:
-            _, chain_rules = self.parse_chain_rules(AELLA_INPUT_CHAIN)
-            for rule in chain_rules:
-                if "AELLA_DEFAULT" in (rule.get("comment") or "") or self._comment_is_user_acl(rule.get("comment")):
-                    self._delete_chain_rule_line(rule["raw"])
-            subprocess.run(["sudo", "iptables", "-F", AELLA_INPUT_CHAIN], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-            subprocess.run(["sudo", "iptables", "-X", AELLA_INPUT_CHAIN], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-
-    def _run_policy_wizard(self) -> Optional[dict]:
-        exclude_ips = ACL_EXCLUDE_IPS
-        candidates = self.list_candidate_ifaces(exclude_ips=exclude_ips)
-        if not candidates:
-            print("ACL 적용 가능한 IPv4 인터페이스가 없습니다.\n")
-            return None
-
-        mode_text = (
-            "Select ACL mode.\n\n"
-            "Whitelist: only the rules you enter are allowed, everything else is dropped (DROP). "
-            "You must allow your SSH management IP.\n"
-            "Blacklist: only the rules you enter are dropped (DROP), everything else is allowed (ACCEPT)."
-        )
-        mode = self._run_whiptail_radiolist(
-            "ACL Mode",
-            mode_text,
-            [
-                ("whitelist", "Allow only listed rules (default deny)", True),
-                ("blacklist", "Deny only listed rules (default allow)", False),
-            ],
-        )
-        if not mode:
-            return None
-
-        iface_items = []
-        for i, item in enumerate(candidates):
-            iface = item["iface"]
-            ips = ", ".join(item["ipv4"])
-            iface_items.append((iface, "IPv4: {}".format(ips), i == 0))
-        iface = self._run_whiptail_radiolist("ACL Interface", "Select a single interface for ACL.", iface_items)
-        if not iface:
-            return None
-
-        return {"mode": mode, "iface": iface, "exclude_ip": list(exclude_ips)}
-
-    def configure_acl_policy(self) -> bool:
-        warning_text = (
-            "WARNING: Re-initializing ACL policy will DELETE ALL existing ACL rules (staged and applied).\n"
-            "This action cannot be undone. Continue?"
-        )
-        if not self._run_whiptail_yesno("ACL Policy", warning_text):
-            return False
-
-        self._delete_acl_state_file()
-        self._clear_acl_staging()
-        self._clear_aella_managed_rules()
-
-        state = self._run_policy_wizard()
-        if not state:
-            return False
-
-        self._save_acl_state(state)
-        print("Policy is configured. No firewall rules are active until at least one ACL rule is added and 'set acl apply' is executed.\n")
-        return True
-
-    def get_current_ssh_client_ip(self) -> Optional[str]:
-        """Get current SSH client IPv4 address if available"""
-        env_val = os.environ.get("SSH_CONNECTION")
-        if env_val:
-            tokens = env_val.strip().split()
-            candidate = tokens[0] if tokens else None
-            if candidate and self.valid_ipv4_address(candidate):
-                return candidate
-        env_val = os.environ.get("SSH_CLIENT")
-        if env_val:
-            tokens = env_val.strip().split()
-            candidate = tokens[0] if tokens else None
-            if candidate and self.valid_ipv4_address(candidate):
-                return candidate
-        return None
-
-    def _run_iptables(self, args: list[str], error_prefix: str) -> str:
-        proc = subprocess.run(["sudo", "iptables"] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        if proc.returncode != 0:
-            err_msg = proc.stderr.strip() if proc.stderr else "Unknown error"
-            raise RuntimeError("{}: {}".format(error_prefix, err_msg))
-        return proc.stdout or ""
-
-    def _read_chain_rule_lines(self, chain: str) -> list[str]:
-        proc = subprocess.run(["sudo", "iptables", "-S", chain], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        if proc.returncode != 0:
-            return []
-        return [line for line in proc.stdout.splitlines() if line.startswith("-A ")]
-
-    def _delete_chain_rule_line(self, line: str) -> None:
-        tokens = shlex.split(line)
-        if not tokens or tokens[0] != "-A":
-            return
-        tokens[0] = "-D"
-        self._run_iptables(tokens, "Failed to delete iptables rule")
-
-    def parse_chain_rules(self, chain: str) -> tuple[list[str], list[dict]]:
-        lines = self._read_chain_rule_lines(chain)
-        rules = []
-        for line in lines:
-            tokens = shlex.split(line)
-            rule = {
-                "raw": line,
-                "src": None,
-                "proto": None,
-                "dport": None,
-                "target": None,
-                "comment": None,
-            }
-            i = 0
-            while i < len(tokens):
-                tok = tokens[i]
-                if tok == "-s" and i + 1 < len(tokens):
-                    rule["src"] = tokens[i + 1]
-                    i += 2
-                    continue
-                if tok == "-p" and i + 1 < len(tokens):
-                    rule["proto"] = tokens[i + 1]
-                    i += 2
-                    continue
-                if tok == "--dport" and i + 1 < len(tokens):
-                    rule["dport"] = tokens[i + 1]
-                    i += 2
-                    continue
-                if tok == "-j" and i + 1 < len(tokens):
-                    rule["target"] = tokens[i + 1]
-                    i += 2
-                    continue
-                if tok == "--comment" and i + 1 < len(tokens):
-                    rule["comment"] = tokens[i + 1]
-                    i += 2
-                    continue
-                i += 1
-            rules.append(rule)
-        return lines, rules
-
-    def ensure_aella_chain(self) -> None:
-        proc = subprocess.run(["sudo", "iptables", "-S", AELLA_INPUT_CHAIN], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        if proc.returncode == 0:
-            return
-        self._run_iptables(["-N", AELLA_INPUT_CHAIN], "Failed to create AELLA_INPUT chain")
-
-    def ensure_established_rule(self) -> None:
-        lines = self._read_chain_rule_lines("INPUT")
-        for line in lines:
-            if AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT in line:
-                self._delete_chain_rule_line(line)
-        self._run_iptables(
-            [
-                "-I",
-                "INPUT",
-                "1",
-                "-m",
-                "conntrack",
-                "--ctstate",
-                "ESTABLISHED,RELATED",
-                "-j",
-                "ACCEPT",
-                "-m",
-                "comment",
-                "--comment",
-                AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT,
-            ],
-            "Failed to ensure established/related rule",
-        )
-
-    def ensure_jump_rule(self, iface: str) -> None:
-        lines = self._read_chain_rule_lines("INPUT")
-        for line in lines:
-            if "-j {}".format(AELLA_INPUT_CHAIN) in line:
-                self._delete_chain_rule_line(line)
-        self._run_iptables(
-            [
-                "-I",
-                "INPUT",
-                "2",
-                "-i",
-                iface,
-                "-j",
-                AELLA_INPUT_CHAIN,
-                "-m",
-                "comment",
-                "--comment",
-                AELLA_SYSTEM_JUMP_COMMENT,
-            ],
-            "Failed to ensure AELLA jump rule",
-        )
-
-    def ensure_default_tail_rule_last(self, mode: str) -> None:
-        lines = self._read_chain_rule_lines(AELLA_INPUT_CHAIN)
-        for line in lines:
-            if "AELLA_DEFAULT" in line:
-                self._delete_chain_rule_line(line)
-        if mode == "whitelist":
-            self._run_iptables(
-                [
-                    "-A",
-                    AELLA_INPUT_CHAIN,
-                    "-j",
-                    "DROP",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    AELLA_DEFAULT_WHITELIST_COMMENT,
-                ],
-                "Failed to ensure default whitelist tail rule",
-            )
-        else:
-            self._run_iptables(
-                [
-                    "-A",
-                    AELLA_INPUT_CHAIN,
-                    "-j",
-                    "ACCEPT",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    AELLA_DEFAULT_BLACKLIST_COMMENT,
-                ],
-                "Failed to ensure default blacklist tail rule",
-            )
-
-    def build_user_rule_args(self, src: str, port: str, mode: str, desc: str) -> list[str]:
-        target = "ACCEPT" if mode == "whitelist" else "DROP"
-        args = ["-A", AELLA_INPUT_CHAIN]
-        any_source = src in ("0.0.0.0/0", "0.0.0.0")
-        if not any_source:
-            args.extend(["-s", src])
-        if port != "all":
-            args.extend(["-p", "tcp", "--dport", str(port)])
-        comment_value = ACL_COMMENT_PREFIX + (desc or "").strip()
-        args.extend(["-m", "comment", "--comment", comment_value, "-j", target])
-        return args
-
-    def _rule_signature(self, src: Optional[str], proto: Optional[str], dport: Optional[str], target: Optional[str]) -> tuple:
-        src_key = src if src else "0.0.0.0/0"
-        dport_key = dport if dport else "all"
-        if dport_key != "all":
-            proto_key = proto if proto else "tcp"
-        else:
-            proto_key = proto if proto else "all"
-        return (src_key, proto_key, dport_key, target or "")
-
-    def _comment_is_user_acl(self, comment: Optional[str]) -> bool:
-        if not comment:
-            return False
-        if "AELLA_ACL_AUTO" in comment:
-            return False
-        return comment.startswith(ACL_COMMENT_PREFIX.strip())
-
-    def _comment_is_default_tail(self, comment: Optional[str]) -> bool:
-        return bool(comment and comment.startswith("AELLA_DEFAULT"))
-
-    def apply_merge(self, staging_rules: list[dict], state: dict) -> None:
-        if not staging_rules:
-            print("No staged ACL rules. Nothing to apply.\n")
-            return
-        self.ensure_aella_chain()
-        self.ensure_established_rule()
-        self.ensure_jump_rule(state["iface"])
-
-        _, chain_rules = self.parse_chain_rules(AELLA_INPUT_CHAIN)
-        existing_keys = set()
-        for rule in chain_rules:
-            if not self._comment_is_user_acl(rule.get("comment")):
-                continue
-            existing_keys.add(self._rule_signature(rule.get("src"), rule.get("proto"), rule.get("dport"), rule.get("target")))
-
-        for rule in chain_rules:
-            if self._comment_is_default_tail(rule.get("comment")):
-                self._delete_chain_rule_line(rule["raw"])
-
-        for rule in staging_rules:
-            source = rule.get("source")
-            ports = rule.get("ports", [])
-            desc = rule.get("desc", "")
-            for port in ports:
-                args = self.build_user_rule_args(source, port, state["mode"], desc)
-                key = self._rule_signature(
-                    None if source in ("0.0.0.0/0", "0.0.0.0") else source,
-                    "tcp" if port != "all" else None,
-                    None if port == "all" else str(port),
-                    "ACCEPT" if state["mode"] == "whitelist" else "DROP",
-                )
-                if key in existing_keys:
-                    continue
-                self._run_iptables(args, "Failed to apply ACL rule")
-                existing_keys.add(key)
-
-        self.ensure_default_tail_rule_last(state["mode"])
-        self._clear_acl_staging()
-
-    def apply_reset(self, staging_rules: list[dict], state: dict) -> None:
-        if not staging_rules:
-            print("No staged ACL rules. Nothing to apply.\n")
-            return
-        self.ensure_aella_chain()
-        self.ensure_established_rule()
-        self.ensure_jump_rule(state["iface"])
-
-        lines, parsed = self.parse_chain_rules(AELLA_INPUT_CHAIN)
-        for rule in parsed:
-            if self._comment_is_user_acl(rule.get("comment")) or self._comment_is_default_tail(rule.get("comment")):
-                self._delete_chain_rule_line(rule["raw"])
-
-        for rule in staging_rules:
-            source = rule.get("source")
-            ports = rule.get("ports", [])
-            desc = rule.get("desc", "")
-            for port in ports:
-                args = self.build_user_rule_args(source, port, state["mode"], desc)
-                self._run_iptables(args, "Failed to apply ACL rule")
-
-        self.ensure_default_tail_rule_last(state["mode"])
-        self._clear_acl_staging()
-
-    def unset_acl(self, src: str, ports: list[str], state: Optional[dict]) -> tuple[int, int]:
-        live_removed = 0
-        staged_removed = 0
-
-        if ports != ["all"]:
-            normalized_ports = []
-            for p in ports:
-                p = "icmp" if p == "ping" else p
-                if p not in normalized_ports:
-                    normalized_ports.append(p)
-            ports = normalized_ports
-
-        any_source = src in ("0.0.0.0/0", "0.0.0.0")
-        _, chain_rules = self.parse_chain_rules(AELLA_INPUT_CHAIN)
-        for rule in chain_rules:
-            if not self._comment_is_user_acl(rule.get("comment")):
-                continue
-            rule_src = rule.get("src")
-            if any_source:
-                if rule_src and rule_src != "0.0.0.0/0":
-                    continue
-            else:
-                if rule_src != src:
-                    continue
-            if rule.get("proto") == "icmp":
-                rule_port = "icmp"
-            else:
-                rule_port = rule.get("dport") if rule.get("dport") else "all"
-            if "all" in ports:
-                if rule_port != "all":
-                    continue
-            else:
-                if rule_port not in [str(p) for p in ports]:
-                    continue
-            self._delete_chain_rule_line(rule["raw"])
-            live_removed += 1
-
-        staging = self._load_acl_staging()
-        rules = staging.get("rules", [])
-        new_rules = []
-        for rule in rules:
-            rule_source = rule.get("source")
-            rule_ports = [str(p) for p in rule.get("ports", [])]
-            if any_source:
-                if rule_source not in ("0.0.0.0/0", "0.0.0.0"):
-                    new_rules.append(rule)
-                    continue
-            else:
-                if rule_source != src:
-                    new_rules.append(rule)
-                    continue
-
-            if "all" in ports:
-                if "all" in rule_ports:
-                    staged_removed += 1
-                    continue
-                new_rules.append(rule)
-                continue
-
-            if "all" in rule_ports:
-                new_rules.append(rule)
-                continue
-
-            remaining_ports = [p for p in rule_ports if p not in [str(pv) for pv in ports]]
-            if remaining_ports != rule_ports:
-                staged_removed += 1
-            if remaining_ports:
-                rule["ports"] = remaining_ports
-                new_rules.append(rule)
-
-        if new_rules != rules:
-            staging["rules"] = new_rules
-            self._save_acl_staging(staging)
-        return live_removed, staged_removed
-
-    def show_acl(self) -> str:
-        output = "\n"
-        output += "=" * 60 + "\n"
-        output += "Access Control List (AELLA_ACL rules)\n"
-        output += "=" * 60 + "\n"
-
-        state = self._load_acl_state()
-        mode = state.get("mode") or "unset"
-        iface = state.get("iface") or "unset"
-        output += "Mode: {}\n".format(mode)
-        output += "Interface: {}\n".format(iface)
-        output += "-" * 60 + "\n"
-
-        input_lines = self._read_chain_rule_lines("INPUT")
-        established_present = any(AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT in line for line in input_lines)
-        jump_line = next((line for line in input_lines if AELLA_SYSTEM_JUMP_COMMENT in line), None)
-        jump_iface = None
-        if jump_line:
-            match = re.search(r"-i\s+(\S+)", jump_line)
-            if match:
-                jump_iface = match.group(1)
-
-        output += "System: established rule: {}\n".format("present" if established_present else "absent")
-        if jump_line:
-            output += "System: jump rule: present (iface {})\n".format(jump_iface or "unknown")
-        else:
-            output += "System: jump rule: absent\n"
-        output += "-" * 60 + "\n"
-
-        _, rules = self.parse_chain_rules(AELLA_INPUT_CHAIN)
-        acl_entries = []
-        tail_entry = None
-        for rule in rules:
-            comment = rule.get("comment") or ""
-            if self._comment_is_user_acl(comment):
-                target = rule.get("target")
-                action = "allow" if target == "ACCEPT" else "deny"
-                source = rule.get("src") if rule.get("src") else "0.0.0.0/0"
-                port = rule.get("dport") if rule.get("dport") else "all"
-                desc = ""
-                if comment.startswith(ACL_COMMENT_PREFIX):
-                    desc = comment.replace(ACL_COMMENT_PREFIX, "", 1).strip()
-                acl_entries.append((action, source, port, desc))
-                continue
-            if comment.startswith("AELLA_DEFAULT"):
-                tail_entry = comment
-
-        if acl_entries:
-            for action, source, port, desc in acl_entries:
-                if desc:
-                    output += "  {} {} {} ({})\n".format(action, source, port, desc)
-                else:
-                    output += "  {} {} {}\n".format(action, source, port)
-        else:
-            output += "  No AELLA_ACL rules found\n"
-
-        if tail_entry:
-            output += "  [{}]\n".format(tail_entry)
-
-        output += "\n"
-        print(output)
-        return output
-
-    def compute_apply_risk(self, mode: str, client_ip: Optional[str], staging_rules: list[dict], live_rules: list[dict]) -> tuple[str, str]:
-        if not client_ip:
-            return ("WARN", "Unable to detect current SSH client IP. Applying may terminate your session and block future access.")
-
-        def _ip_in_sources(ip: str, sources: list[str]) -> bool:
-            ip_obj = ipaddress.ip_address(ip)
-            for src in sources:
-                try:
-                    if src in ("0.0.0.0/0", "0.0.0.0"):
-                        return True
-                    if "/" in src:
-                        if ip_obj in ipaddress.ip_network(src, strict=False):
-                            return True
-                    else:
-                        if ip_obj == ipaddress.ip_address(src):
-                            return True
-                except Exception:
-                    continue
-            return False
-
-        sources = []
-        for rule in staging_rules:
-            source = rule.get("source")
-            if source:
-                sources.append(source)
-
-        if mode == "whitelist":
-            if not _ip_in_sources(client_ip, sources):
-                return ("HIGH", "Your current SSH client IP is NOT in the allow list. Applying may terminate your session and block future access.")
-        if mode == "blacklist":
-            if _ip_in_sources(client_ip, sources):
-                return ("HIGH", "Your current SSH client IP IS in the deny list. Applying may terminate your session immediately.")
-
-        return ("OK", "No immediate SSH risk detected based on current rules.")
-
-    def confirm_apply_with_risk_summary(self, mode: str, iface: str, client_ip: Optional[str], risk_level: str, risk_message: str) -> bool:
-        client_ip_text = client_ip if client_ip else "Unable to detect current SSH client IP"
-        summary = (
-            "Review before applying ACL.\n\n"
-            "Mode: {}\n"
-            "Interface: {}\n"
-            "SSH Client IP: {}\n"
-            "Risk: {}\n\n"
-            "{}\n\n"
-            "Continue?"
-        ).format(mode, iface, client_ip_text, risk_level, risk_message)
-        return self._run_whiptail_yesno("ACL Apply Confirmation", summary)
-
-    def _get_mgt_ipv4(self) -> str:
-        return self._get_acl_ipv4("mgt")
-
-    def _acl_iface_exists(self, interface: str) -> bool:
-        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface or ""):
-            return False
-        proc = subprocess.run(
-            ["ip", "link", "show", "dev", interface],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-        )
-        return proc.returncode == 0
-
-    def _get_acl_ipv4(self, interface: str) -> str:
-        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface or ""):
-            raise RuntimeError("Unsupported ACL interface")
-        candidates = [interface]
-        if interface == "host":
-            candidates.append("hostmgmt")
-        for candidate in candidates:
-            proc = subprocess.run(
-                ["ip", "-4", "addr", "show", "dev", candidate],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, check=False,
-            )
-            if proc.returncode != 0:
-                continue
-            match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", proc.stdout)
-            if match:
-                return match.group(1)
-        raise RuntimeError("No IPv4 address found for ACL interface {}".format(interface))
-
-    def _ensure_local_ip_allow_rules(self, cidrs):
-        for cidr in cidrs:
-            try:
-                normalized = str(ipaddress.ip_network(cidr, strict=False))
-            except ValueError:
-                continue
-            args = [
-                "sudo", "iptables", "-C", "INPUT", "-d", normalized,
-                "-m", "comment", "--comment", LOCAL_ALWAYS_ALLOW_COMMENT,
-                "-j", "ACCEPT",
-            ]
-            check = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            if check.returncode != 0:
-                add = [
-                    "sudo", "iptables", "-I", "INPUT", "1", "-d", normalized,
-                    "-m", "comment", "--comment", LOCAL_ALWAYS_ALLOW_COMMENT,
-                    "-j", "ACCEPT",
-                ]
-                subprocess.run(add, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-
-    def _ensure_established_related_rule(self):
-        args = [
-            "sudo", "iptables", "-C", "INPUT", "-m", "conntrack",
-            "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT",
-            "-m", "comment", "--comment", AELLA_SYSTEM_ALLOW_ESTABLISHED_COMMENT,
-        ]
-        check = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        if check.returncode != 0:
-            subprocess.run(
-                ["sudo", "iptables", "-I", "INPUT", "1"] + args[2:],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-            )
-
-    def _purge_legacy_local_always_allow_rules(self):
-        proc = subprocess.run(
-            ["sudo", "iptables", "-L", "INPUT", "-n", "-v", "--line-numbers"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
-        )
-        if proc.returncode != 0:
-            return
-        line_numbers = []
-        for line in proc.stdout.splitlines():
-            if LOCAL_ALWAYS_ALLOW_COMMENT not in line:
-                continue
-            match = re.match(r"^\s*(\d+)\s+", line)
-            if match:
-                line_numbers.append(int(match.group(1)))
-        for number in sorted(set(line_numbers), reverse=True):
-            subprocess.run(
-                ["sudo", "iptables", "-D", "INPUT", str(number)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-            )
-
-    def _iptables_add_auto_ssh(self, ssh_ip: str) -> None:
-        try:
-            normalized_ip = str(ipaddress.ip_address(ssh_ip))
-        except ValueError:
-            return
-        if ":" in normalized_ip:
-            return
-        args = [
-            "sudo", "iptables", "-C", "INPUT", "-s", normalized_ip,
-            "-p", "tcp", "--dport", "22", "-m", "comment",
-            "--comment", ACL_AUTO_COMMENT, "-j", "ACCEPT",
-        ]
-        check = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        if check.returncode != 0:
-            subprocess.run(
-                ["sudo", "iptables", "-I", "INPUT", "-s", normalized_ip,
-                 "-p", "tcp", "--dport", "22", "-m", "comment",
-                 "--comment", ACL_AUTO_COMMENT, "-j", "ACCEPT"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-            )
-
-    def _load_acl_staging(self) -> dict:
-        default_data = {"rules": []}
-        try:
-            _ensure_root_owned_directory("/var/lib/aella", mode=0o750)
-            data = json.loads(_read_root_text_file(ACL_STAGING_PATH))
-        except Exception:
-            return default_data
-        if not isinstance(data, dict) or not isinstance(data.get("rules", []), list):
-            return default_data
-
-        valid_rules = []
-        for rule in data.get("rules", []):
-            if not isinstance(rule, dict) or rule.get("action") not in {"allow", "deny"}:
-                continue
-            source = rule.get("source")
-            try:
-                source = str(ipaddress.ip_network(source, strict=False))
-            except (TypeError, ValueError):
-                continue
-            ports = rule.get("ports")
-            if not isinstance(ports, list) or not ports:
-                continue
-            normalized_ports = []
-            valid = True
-            for port in ports:
-                value = str(port).lower()
-                if value in {"all", "icmp", "ping"}:
-                    normalized_ports.append("icmp" if value == "ping" else value)
-                elif value.isdigit() and 1 <= int(value) <= 65535:
-                    normalized_ports.append(value)
-                else:
-                    valid = False
-                    break
-            if not valid:
-                continue
-            description = rule.get("desc", "")
-            if not isinstance(description, str):
-                description = ""
-            description = "".join(ch for ch in description if ch.isprintable())[:180]
-            valid_rules.append({
-                "action": rule["action"],
-                "source": source,
-                "ports": normalized_ports,
-                "desc": description,
-            })
-        return {"rules": valid_rules}
-
-    def _save_acl_staging(self, data: dict) -> None:
-        _ensure_root_owned_directory("/var/lib/aella", mode=0o750)
-        payload = json.dumps(data, indent=2, sort_keys=False)
-        _write_root_text_file(ACL_STAGING_PATH, payload)
-
-    def _run_cmd(self, cmd) -> tuple[int, str, str]:
-        """Execute argv or parse a legacy command string without a shell."""
-        try:
-            argv = shlex.split(cmd) if isinstance(cmd, str) else list(cmd)
-        except (TypeError, ValueError) as exc:
-            return 2, "", str(exc)
-        if not argv or any(not isinstance(item, str) for item in argv):
-            return 2, "", "Invalid command arguments"
-        proc = subprocess.run(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, check=False,
-        )
-        return proc.returncode, proc.stdout or "", proc.stderr or ""
-
-    def _load_acl_state(self) -> dict:
-        default_data = {}
-        try:
-            _ensure_root_owned_directory("/var/lib/aella", mode=0o750)
-            data = json.loads(_read_root_text_file(ACL_STATE_PATH))
-        except Exception:
-            return default_data
-        if not isinstance(data, dict):
-            return default_data
-        mode = data.get("mode")
-        iface = data.get("iface")
-        if mode not in ("whitelist", "blacklist") or not isinstance(iface, str):
-            return default_data
-        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", iface):
-            return default_data
-        iface_ip = data.get("iface_ip")
-        if iface_ip is not None:
-            try:
-                data["iface_ip"] = str(ipaddress.IPv4Address(iface_ip))
-            except ValueError:
-                return default_data
-        return data
 
     def _save_acl_state(self, data: dict) -> None:
         _ensure_root_owned_directory("/var/lib/aella", mode=0o750)
@@ -3765,78 +2906,53 @@ class AellaCli(cmd.Cmd, object):
         if self.is_sensor_host_mode():
             self.unset_interface_sensor(param)
             return
-
-        contents = list()
-
-        if not param or param[0].endswith('?') or len(param) <= 3:
-            if (len(param) == 0 or param[0] == '?'):
-                print('\n<Interface Name>  Specify a supported interface (data1g or data10g)\n')
-                return
-            elif (len(param) == 1 and re.match('data1[0]?g[?]', param[0])) or \
-                (len(param) == 1 and re.match('data1[0]?g', param[0])) or \
-                (len(param) == 2 and re.match('data1[0]?g', param[0]) and param[1] == '?'):
-                print('\nip         Unset the IP address on the interface {}'.format(param[0].rstrip('?')))
-                print('gateway    Unset the default gateway on the interface {}'.format(param[0].rstrip('?')))
-                print('restart    Restart network interface\n')
-                return
-            elif (len(param) == 1 and not re.match('data1[0]?g[?]', param[0])) or \
-                (len(param) == 2 and not re.match('data1[0]?g', param[0]) and param[1] == '?') or \
-                (len(param) == 2 and not re.match('data1[0]?g', param[0]) and re.match('ip|gateway|restart', param[1])):
-                print('\n<Interface Name>  Specify a supported interface (data1g or data10g)\n')
-                return
-            elif len(param) == 2 and re.match('data1[0]?g', param[0]) and not re.match('ip|gateway|restart', param[1]):
-                print('Invalid option: Available options are "ip", "gateway", and "restart"')
-                print('\nip         Unset the IP address on the interface {}'.format(param[0]))
-                print('gateway    Unset the default gateway on the interface {}'.format(param[0]))
-                print('restart    Restart network interface\n')
-                return
-            elif (len(param) == 2 and re.match('data1[0]?g', param[0]) and re.match('ip[?]|gateway[?]|restart[?]', param[1])) or \
-                (len(param) == 3 and re.match('data1[0]?g', param[0]) and re.match('ip|gateway|restart', param[1]) and param[2].endswith('?')):
-                print("\nPress [Enter]\n")
-                return
-     
+        if not param or len(param) < 2:
+            print("\n<Interface Name>  Specify a supported interface (data1g or data10g)\n")
+            return
         interface = param[0]
         option = param[1]
-
-        # safeguard to protect mgt interface configuration
-        if not self.is_device_exist(interface):
-           return
-        if not re.match('data1[0]?g', interface):
+        if not re.fullmatch(r"data1(?:0)?g", interface) or not self.is_device_exist(interface):
+            print("\n<Interface Name>  Specify a supported interface (data1g or data10g)\n")
             return
-        if option == 'ip':
-            contents.append('auto {}'.format(interface))
-            contents.append('iface {} inet manual'.format(interface))
+        if option == "ip":
+            contents = ["auto {}".format(interface), "iface {} inet manual".format(interface)]
             if not self.update_interface_file(interface, contents):
                 return
-            print("Run 'unset interface {0} restart' command to apply the changes.\n".format(interface))
-
-        elif option == 'gateway':
-            try:
-                # data1g or data10g use table 2
-                cmd_show = 'ip route show table 2 | grep default'
-                p = subprocess.Popen(cmd_show, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-                res = p.communicate() 
-                if not res[0]:
-                    print('Could not find the default gateway on the interface {}\n'.format(interface))
-                    return 
-                m = re.match('default\s+via\s+\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s+dev\s+(\w+)', res[0].decode('utf-8'))
-                if not m.group(1) == interface:
-                    print('Could not delete the default gateway due to interface mismatch\n')
-                    return
-                cmd_del = 'ip route del {} table 2'.format(m.group(0).rstrip())
-                p = subprocess.Popen(cmd_del, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-                res = p.communicate()
-                if res[1]:
-                    print('Could not delete the default gateway on the interface {} or the default gateway was already deleted\n'.format(interface))
-                    print(res[1].decode('utf-8').rstrip())
-                print('Successfully deleted the default gateway: {}\n'.format(m.group(0)))
-
-            except Exception as e:
-                print('Could not delete the default gateway\n')
-
-        elif option == 'restart':
-             print('Restarting network interface. You need to use new IP address to reconnect...\n')
-             self._restart_interface_with_verification(interface)
+            print("Run 'unset interface {} restart' command to apply the changes.\n".format(interface))
+        elif option == "gateway":
+            route_proc = subprocess.run(
+                ["ip", "route", "show", "table", "2"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            )
+            default_line = next((line for line in route_proc.stdout.splitlines() if line.startswith("default ")), None)
+            if not default_line:
+                print("Could not find the default gateway on the interface {}\n".format(interface))
+                return
+            match = re.match(
+                r"^default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+([A-Za-z0-9_.:-]{1,15})(?:\s|$)",
+                default_line,
+            )
+            if not match or match.group(2) != interface:
+                print("Could not delete the default gateway due to interface mismatch\n")
+                return
+            delete_proc = subprocess.run(
+                ["ip", "route", "del", "default", "via", match.group(1),
+                 "dev", match.group(2), "table", "2"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            )
+            if delete_proc.returncode != 0:
+                print("Could not delete the default gateway: {}".format(
+                    delete_proc.stderr.strip() or delete_proc.stdout.strip()
+                ))
+                return
+            print("Successfully deleted the default gateway: {}\n".format(default_line))
+        elif option == "restart":
+            print("Restarting network interface. You need to use new IP address to reconnect...\n")
+            self._restart_interface_with_verification(interface)
+        else:
+            print('Invalid option: Available options are "ip", "gateway", and "restart"')
 
     def complete_unset(self, text, line, begidx, endidx):
         if not text:
@@ -4612,21 +3728,17 @@ class AellaCli(cmd.Cmd, object):
     # Check interface existence
     @staticmethod
     def iface_exists(interface):
+        if not isinstance(interface, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface):
+            return False
         try:
-            cmd = "ifconfig {0} 2>/dev/null".format(interface)
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-            info = proc.communicate()[0].decode().rstrip()
-            rc = proc.returncode
-            if rc or info is None or info == "":
-                return False
-            return True
+            proc = subprocess.run(
+                ["ip", "link", "show", "dev", interface],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            return proc.returncode == 0
         except Exception:
-            # print("interface {} not found".format(interface))
             return False
 
-    # Convert cidr to netmask
-    # It accepts 1.1.1.1/24 or 1.1.1.1/255.255.255.0
-    @staticmethod
     def cidr_to_netmask(cidr):
         address, net_bits = cidr.split('/')
         if net_bits is None or net_bits == "":
@@ -5615,236 +4727,158 @@ class AellaCli(cmd.Cmd, object):
                     continue
 
     def set_interface_callback2(self, param):
-        status = 0
-        output = None
-        if param and param[0] == "mgt":
-            print("Management interface cannot be modified by the generic interface callback.")
+        if not param or len(param) < 3:
+            print("Usage: set interface <interface> <ip|gateway|dns|restart> <value>")
+            return False
+        interface = param[0]
+        field = param[1].lower()
+        if interface == "mgt" or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface):
+            print("Invalid or protected interface name.")
+            return False
+        if not self.iface_exists(interface):
+            print("Interface does not exist.")
+            return False
+        if field not in {"ip", "gateway", "dns", "restart"}:
+            print("Invalid interface option.")
             return False
         try:
-            CLOUD_INIT_FILE = "/etc/network/interfaces.d/50-cloud-init.cfg"
-            if os.path.isfile(CLOUD_INIT_FILE):
-                # We add a newline before we copy over the
-                # cloud init configure file. In previous version,
-                # set interface cli will miss return/newline at the end of
-                # /etc/network/interfaces file and old cli didn't take care
-                # of cloud init file. Therefore if doing set interface
-                # with new version of cli, which copies over the contents of
-                # cloud init, the concatenation will have error due to the missing
-                # newline.
-                subprocess.call("sudo echo \"\" >> /etc/network/interfaces", shell=True)
-                cmd = "sudo cat /etc/network/interfaces.d/50-cloud-init.cfg >> /etc/network/interfaces"
-                proc = subprocess.Popen(cmd, shell=True)
-                proc.wait()
-                os.remove(CLOUD_INIT_FILE)
-            interface = param[0]
-            field = param[1]
-            value = param[2]
+            cloud_init_file = Path("/etc/network/interfaces.d/50-cloud-init.cfg")
+            if cloud_init_file.is_file():
+                interfaces_path = Path("/etc/network/interfaces")
+                with interfaces_path.open("a", encoding="utf-8") as target:
+                    target.write("\n")
+                    with cloud_init_file.open("r", encoding="utf-8") as source:
+                        shutil.copyfileobj(source, target)
+                cloud_init_file.unlink()
 
-            # Those fields are configurable.
-            # Extract those fields from param
-            # If a field is empty, it will not be configured
+            value = param[2]
             network_mode = ""
             new_address = ""
             new_netmask = ""
             new_gateway = ""
             new_dns_server = ""
-            if field.lower() == "ip":
+            new_restart = ""
+            if field == "ip":
                 if value.lower() == "dhcp":
                     network_mode = "dhcp"
                 else:
+                    parsed_ip = ipaddress.IPv4Interface(value)
                     network_mode = "static"
-                    new_address, new_netmask = self.cidr_to_netmask(value)
-            if field.lower() == "gateway":
-                new_gateway = value
-            elif field.lower() == "dns":
-                new_dns_server = ' '.join(param[2:])
-            elif field.lower() == "restart":
+                    new_address = str(parsed_ip.ip)
+                    new_netmask = str(parsed_ip.network.netmask)
+            elif field == "gateway":
+                new_gateway = str(ipaddress.IPv4Address(value))
+            elif field == "dns":
+                new_dns_server = " ".join(str(ipaddress.IPv4Address(item)) for item in param[2:])
+            elif field == "restart":
                 new_restart = value
-            conf_f = open("/etc/network/interfaces", 'r')
+
+            with open("/etc/network/interfaces", "r", encoding="utf-8") as conf_f:
+                lines = conf_f.readlines()
             contents = []
-            lines = conf_f.readlines()
-            # A flag whether current line is in the block of
-            # configuring the target interface
             is_iface_config_block = False
-
-            # Whether the interface to configure is already in
-            # /etc/network/interfaces, this flag is used
-            # to determine at the end of parsing, if new interface
-            # should be added to the interface file
             iface_exists = False
-
-            # A flag indicating whether the target iface is actually
-            # configured, this flag is used to make sure that
-            # new configuration is always applied, no matter if an old
-            # configuration already exists or not
             iface_configured = False
-
             netmask_configured = False
-
-            # The flag of whether skipping non-existence iface
             skip_non_existing = False
+            auto_pattern = r"\s*auto {}\b.*".format(re.escape(interface))
+            iface_pattern = r"\s*iface {}\s+.*".format(re.escape(interface))
 
-            # Parse the file line by line, put/replace line and put
-            # into new configuration
             for line in lines:
                 line = line.rstrip()
-                auto_pattern = "\s*auto {0}.*".format(interface)
-                iface_pattern = "\s*iface {0}\s+.*".format(interface)
                 auto_match = re.match(auto_pattern, line)
                 iface_match = re.match(iface_pattern, line)
                 current_iface = self.get_interface_from_line(line)
-
-                # If this is a start of a configuration block
-                # we check if that interface actually exists
-                # If this iface does not exists, we need to skip following
-                # lines until we met a valid interface
-                if not current_iface == "":
+                if current_iface:
                     if not self.iface_exists(current_iface):
-                        print('{} - this line does not contain valid interface'.format(line))
                         skip_non_existing = True
                         continue
-                    else:
-                        skip_non_existing = False
-
-                # If this line starts the configuration of the target interface
+                    skip_non_existing = False
+                if skip_non_existing:
+                    continue
                 if auto_match or iface_match:
                     is_iface_config_block = True
                     iface_exists = True
                 if is_iface_config_block:
-                    # If this is the line of iface .... inet ... static|dhcp
                     if iface_match:
-                        # The original network mode
-                        tokens = re.match("\s*iface\s+(\S+)\s+inet\s+(\S+).*", line)
-                        raw_mode = tokens.group(2)
-                        # Adjust the inet mode
+                        tokens = re.match(r"\s*iface\s+(\S+)\s+inet\s+(\S+).*", line)
+                        raw_mode = tokens.group(2) if tokens else ""
                         if raw_mode == "static" and network_mode == "dhcp":
-                            contents.append("iface {0} inet dhcp".format(interface))
+                            contents.append("iface {} inet dhcp".format(interface))
                             iface_configured = True
                         elif raw_mode == "dhcp" and network_mode == "static":
-                            contents.append("iface {0} inet static".format(interface))
+                            contents.append("iface {} inet static".format(interface))
                         else:
                             contents.append(line)
-                            network_mode = raw_mode
+                            if raw_mode:
+                                network_mode = raw_mode
                     elif auto_match:
                         contents.append(line)
-                    # Matching the address line
-                    elif re.match("\s*address\s+(.*)", line):
+                    elif re.match(r"\s*address\s+(.+)", line):
                         if network_mode == "dhcp":
-                            print("DHCP does not require an explicit address")
-                        elif new_address:
-                            contents.append("address {0}".format(new_address))
+                            continue
+                        if new_address:
+                            contents.append("address {}".format(new_address))
                             iface_configured = True
                         else:
                             contents.append(line)
-                    # Matching the netmask line
-                    elif re.match("\s*netmask\s+(.*)", line):
+                    elif re.match(r"\s*netmask\s+(.+)", line):
                         if network_mode == "dhcp":
-                            print("DHCP does not require an explicit address")
-                        elif new_netmask:
-                            contents.append("netmask {0}".format(new_netmask))
+                            continue
+                        if new_netmask:
+                            contents.append("netmask {}".format(new_netmask))
                             netmask_configured = True
-                            iface_configured = True
                         else:
                             contents.append(line)
-                    # Matching the gateway line
-                    elif re.match("\s*gateway\s+.*", line):
-                        if network_mode == "dhcp":
-                            print("DHCP does not require an explicit address")
-                        elif new_gateway:
-                            contents.append("gateway {0}".format(new_gateway))
-                            iface_configured = True
-                        else:
+                    elif re.match(r"\s*gateway\s+(.+)", line):
+                        if new_gateway:
+                            contents.append("gateway {}".format(new_gateway))
+                        elif field != "gateway":
                             contents.append(line)
-                    # Matching the dns line, for dns, we do append instead of overwrite
-                    elif re.match("\s*dns-nameservers\s+(.*)", line):
+                    elif re.match(r"\s*dns-nameservers\s+(.+)", line):
                         if new_dns_server:
-                            contents.append("dns-nameservers {0}".format(new_dns_server))
-                            iface_configured = True
-                        else:
+                            contents.append("dns-nameservers {}".format(new_dns_server))
+                        elif field != "dns":
                             contents.append(line)
-                    # The end of the configuration block of the target interface,
-                    # if no configure is applied yet, apply the new configuration.
-                    # The creteria is that this line is started with "auto" or "iface"
-                    # but the interface name is not the configuration target interface.
-                    # If the iface_configured is not set, apply the configuration
-                    # at this point
-                    elif (not auto_match and not iface_match and
-                          (re.match("\s*auto .*", line) or re.match("\s*iface .*", line))):
-                        if not iface_configured:
-                            if not new_address == "":
-                                contents.append("address {0}".format(new_address))
-                            if not new_netmask == "":
-                                contents.append("netmask {0}".format(new_netmask))
-                            if not new_gateway == "":
-                                contents.append("gateway {0}".format(new_gateway))
-                            if not new_dns_server == "":
-                                contents.append("dns-nameservers {0}".format(new_dns_server))
-                            iface_configured = True
-                        elif not new_netmask == "" and not netmask_configured and not network_mode == "dhcp":
-                            contents.append("netmask {0}".format(new_netmask))
-                            netmask_configured = True
-                        # Exiting the target configuration block
-                        contents.append(line)
-                        is_iface_config_block = False
                     else:
-                        # Irrelevant lines
                         contents.append(line)
                 else:
-                    # Lines that are irrelevant to current configurations,
-                    # keep them untouched in new configuration
-                    if not skip_non_existing:
-                        # If this line belongs to an existing interface
-                        # will new configuration include it
-                        contents.append(line)
-            if iface_exists is False:
-                # Add a new entry
-                if field == "ip":
-                    contents.append("auto {0}".format(interface))
-                    if network_mode == "dhcp":
-                        contents.append("iface {0} inet dhcp".format(interface))
-                    else:
-                        contents.append("iface {0} inet static".format(interface))
-                        contents.append("address {0}".format(new_address))
-                        contents.append("netmask {0}".format(new_netmask))
-            # Interface exists but not configured yet
-            # This is for corner case where the target interface is the last
-            # interface in configuration file
-            # e.g. the last line is
-            # iface target inet dhcp
-            # and the new set is static with ip
-            elif iface_configured is False:
-                if not new_address == "":
-                    contents.append("address {0}".format(new_address))
-                if not new_netmask == "":
-                    contents.append("netmask {0}".format(new_netmask))
-                if not new_gateway == "":
-                    contents.append("gateway {0}".format(new_gateway))
-                if not new_dns_server == "":
-                    contents.append("dns-nameservers {0}".format(new_dns_server))
-            elif not new_netmask == "" and not netmask_configured and not network_mode == "dhcp":
-                contents.append("netmask {0}".format(new_netmask))
-                netmask_configured = True
-            #contents.append("\n") . If this line exists, extra empty line will be added whenever you execute "set interface" command
-            conf_f.close()
-            # Now the parsing is finished, update interface file
-            # DEBUG: print("{0}".format(contents))
-            if not self.write_full_interfaces_file(contents):
-                status = 1
-                return
-            if field.lower() == "restart":
-                print('Restarting network interface. You need to use new IP address to reconnect...\n')
-                if not self._restart_interface_with_verification(interface):
-                    status = 1
-                    return
-            if not (field.lower() == "restart"): 
-                print("Run 'set interface {0} restart' command to apply the changes.\n".format(interface))
+                    contents.append(line)
 
-        except Exception as e:
-            status = 1
-            print("Failed to set interface: {} ".format(e))
-        return status, output
+            if not iface_exists:
+                contents.extend(["", "auto {}".format(interface)])
+                if network_mode == "dhcp":
+                    contents.append("iface {} inet dhcp".format(interface))
+                else:
+                    contents.append("iface {} inet static".format(interface))
+                    if new_address:
+                        contents.append("address {}".format(new_address))
+                    if new_netmask:
+                        contents.append("netmask {}".format(new_netmask))
+                    if new_gateway:
+                        contents.append("gateway {}".format(new_gateway))
+                    if new_dns_server:
+                        contents.append("dns-nameservers {}".format(new_dns_server))
+            else:
+                if network_mode == "static":
+                    if new_address and not iface_configured:
+                        contents.append("address {}".format(new_address))
+                    if new_netmask and not netmask_configured:
+                        contents.append("netmask {}".format(new_netmask))
+                if new_gateway and not any(line.startswith("gateway ") for line in contents):
+                    contents.append("gateway {}".format(new_gateway))
+                if new_dns_server and not any(line.startswith("dns-nameservers ") for line in contents):
+                    contents.append("dns-nameservers {}".format(new_dns_server))
 
-    # Handle to configure data interfaces
+            _atomic_replace_text_file("/etc/network/interfaces", "\n".join(contents).rstrip() + "\n")
+            if field == "restart" or new_restart:
+                return self.restart_network_manager(interface, new_address, new_netmask, new_gateway)
+            print("Run 'set interface {} restart' command to apply the changes.\n".format(interface))
+            return True
+        except Exception as exc:
+            print("Failed to update interface configuration: {}".format(exc))
+            return False
+
     def set_interface_callback3(self, param):
         interface = param[0]
         field = param[1]
@@ -5921,18 +4955,18 @@ class AellaCli(cmd.Cmd, object):
     def _restart_interface_with_verification(self, interface):
         if interface == "mgt":
             return self._restart_mgt_interface()
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface or "") or not self.is_device_exist(interface):
+            print("Invalid interface name.")
+            return False
         expected_ip, expected_dns = self._get_interface_expected_config(interface)
         expected_gateway = self._get_interface_gateway(interface)
         self._ensure_interfaces_base()
         if not self._ensure_iface_stanza(interface, expected_ip, expected_dns):
             return False
-
         dry_run = subprocess.run(
-            "ifup --no-act {}".format(interface),
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            ["ifup", "--no-act", interface],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False,
         )
         if dry_run.returncode != 0:
             print("ifup dry-run failed for {}".format(interface))
@@ -5942,86 +4976,81 @@ class AellaCli(cmd.Cmd, object):
             if dry_run.stderr:
                 print("stderr: {}".format(dry_run.stderr.strip()))
             return False
-
         if not self.restart_new_network_manager(interface, expected_ip=expected_ip, expected_dns=expected_dns):
             return False
-
         if expected_gateway and self.is_sensor_host_mode():
             if not self._ensure_host_gateway(interface, expected_gateway):
                 return False
-
         print("Restart completed.\n")
         return True
 
     def _ensure_host_gateway(self, interface, gateway):
-        cmd_show = "ip route show default"
-        proc = subprocess.Popen(cmd_show, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-        out, _ = proc.communicate()
-        if out:
-            m = re.search(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+(\S+)', out.decode('utf-8', errors='ignore'))
-            if m and m.group(1) == gateway and m.group(2) == interface:
-                return True
-
-        cmd_set = "ip route replace default via {} dev {}".format(gateway, interface)
-        set_proc = subprocess.run(cmd_set, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if set_proc.returncode != 0:
-            err_msg = set_proc.stderr.strip() if set_proc.stderr else set_proc.stdout.strip()
-            err_msg = err_msg if err_msg else "Unknown error"
-            print("Failed to apply host gateway: {}".format(err_msg))
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface or ""):
             return False
-
-        proc = subprocess.Popen(cmd_show, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-        out, _ = proc.communicate()
-        if out:
-            m = re.search(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+(\S+)', out.decode('utf-8', errors='ignore'))
-            if m and m.group(1) == gateway and m.group(2) == interface:
-                return True
-
+        try:
+            gateway = str(ipaddress.IPv4Address(gateway))
+        except ValueError:
+            return False
+        def current_gateway():
+            proc = subprocess.run(
+                ["ip", "route", "show", "default"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            )
+            if proc.returncode != 0:
+                return None
+            for line in proc.stdout.splitlines():
+                match = re.search(r"\bdefault\s+via\s+(\d+\.\d+\.\d+\.\d+)\s+dev\s+([A-Za-z0-9_.:-]{1,15})", line)
+                if match:
+                    return match.group(1), match.group(2)
+            return None
+        if current_gateway() == (gateway, interface):
+            return True
+        set_proc = subprocess.run(
+            ["ip", "route", "replace", "default", "via", gateway, "dev", interface],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False,
+        )
+        if set_proc.returncode != 0:
+            print("Failed to apply host gateway: {}".format((set_proc.stderr or set_proc.stdout).strip()))
+            return False
+        if current_gateway() == (gateway, interface):
+            return True
         print("Failed to verify host default gateway")
         return False
 
     def restart_new_network_manager(self, interface, expected_ip=None, expected_dns=None):
         if interface == "mgt":
             return self._restart_mgt_interface()
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface or "") or not self.is_device_exist(interface):
+            print("Invalid interface name.")
+            return False
         try:
-            rm_proc = subprocess.run(
-                "rm -f /run/resolvconf/interface/{0}.dhclient".format(interface),
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            if expected_ip:
+                expected_ip = str(ipaddress.IPv4Interface(expected_ip))
+            if expected_dns:
+                expected_dns = [str(ipaddress.IPv4Address(value)) for value in expected_dns]
+            dhclient_file = Path("/run/resolvconf/interface") / "{}.dhclient".format(interface)
+            try:
+                if dhclient_file.is_file() or dhclient_file.is_symlink():
+                    dhclient_file.unlink()
+            except FileNotFoundError:
+                pass
             flush_proc = subprocess.run(
-                "ip address flush dev {0}".format(interface),
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+                ["ip", "address", "flush", "dev", interface],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
             )
             if flush_proc.returncode != 0:
-                err_msg = flush_proc.stderr.strip() if flush_proc.stderr else flush_proc.stdout.strip()
-                err_msg = err_msg if err_msg else "Unknown error"
-                print("Failed to restart networking! {}".format(err_msg))
+                print("Failed to restart networking! {}".format((flush_proc.stderr or flush_proc.stdout).strip()))
                 return False
-            down_proc = subprocess.run(
-                "ifdown {0}".format(interface),
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            subprocess.run(["ifdown", interface], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
             up_proc = subprocess.run(
-                "ifup {0}".format(interface),
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+                ["ifup", interface],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
             )
             if up_proc.returncode != 0:
                 err_text = "{}\n{}".format(up_proc.stdout or "", up_proc.stderr or "")
-                if expected_ip and ("File exists" in err_text or "Address already assigned" in err_text):
-                    print("Warning: ifup returned address already assigned; continuing with state verification")
-                else:
+                if not (expected_ip and ("File exists" in err_text or "Address already assigned" in err_text)):
                     print("Failed to restart networking!")
                     print("returncode: {}".format(up_proc.returncode))
                     if up_proc.stdout:
@@ -6029,120 +5058,96 @@ class AellaCli(cmd.Cmd, object):
                     if up_proc.stderr:
                         print("stderr: {}".format(up_proc.stderr.strip()))
                     return False
-        except Exception as e:
-            print("Failed to restart networking! {}".format(e))
-            return False
-
-        addr_out = subprocess.run(
-            "ip -4 addr show dev {}".format(interface),
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        inet_lines = []
-        if addr_out.returncode == 0 and addr_out.stdout:
-            inet_lines = re.findall(r'\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)', addr_out.stdout)
-        if len(inet_lines) == 0 and expected_ip:
-            add_proc = subprocess.run(
-                "ip -4 addr add {} dev {}".format(expected_ip, interface),
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            if add_proc.returncode != 0:
-                err_msg = add_proc.stderr.strip() if add_proc.stderr else add_proc.stdout.strip()
-                err_msg = err_msg if err_msg else "Unknown error"
-                print("Failed to recover IP address on {}: {}".format(interface, err_msg))
-                return False
-            addr_out = subprocess.run(
-                "ip -4 addr show dev {}".format(interface),
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            inet_lines = re.findall(r'\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)', addr_out.stdout or "")
-            if len(inet_lines) != 1 or expected_ip not in inet_lines:
-                print("Failed to verify IPv4 address count on {} after recovery".format(interface))
-                return False
-        if len(inet_lines) > 1:
-            if not expected_ip:
-                print("Multiple IPv4 addresses detected on {} after restart".format(interface))
-                return False
-            subprocess.run(
-                "ip -4 addr flush dev {}".format(interface),
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            add_proc = subprocess.run(
-                "ip -4 addr add {} dev {}".format(expected_ip, interface),
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            if add_proc.returncode != 0:
-                err_msg = add_proc.stderr.strip() if add_proc.stderr else "Unknown error"
-                print("Failed to recover IP address on {}: {}".format(interface, err_msg))
-                return False
-            addr_out = subprocess.run(
-                "ip -4 addr show dev {}".format(interface),
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            inet_lines = re.findall(r'\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)', addr_out.stdout or "")
-            if len(inet_lines) != 1 or expected_ip not in inet_lines:
-                print("Failed to verify IPv4 address count on {} after recovery".format(interface))
-                return False
-
-        if expected_ip:
-            check_proc = subprocess.run(
-                "ip -4 addr show dev {}".format(interface),
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            if check_proc.returncode != 0 or expected_ip not in check_proc.stdout:
+                print("Warning: ifup returned address already assigned; continuing with state verification")
+            def current_ipv4():
+                result = subprocess.run(
+                    ["ip", "-4", "addr", "show", "dev", interface],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                )
+                if result.returncode != 0:
+                    return []
+                return re.findall(r"\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)", result.stdout)
+            inet_lines = current_ipv4()
+            if not inet_lines and expected_ip:
+                add_proc = subprocess.run(
+                    ["ip", "-4", "addr", "add", expected_ip, "dev", interface],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                )
+                if add_proc.returncode != 0:
+                    print("Failed to recover IP address on {}: {}".format(interface, (add_proc.stderr or add_proc.stdout).strip()))
+                    return False
+                inet_lines = current_ipv4()
+                if len(inet_lines) != 1 or expected_ip not in inet_lines:
+                    print("Failed to verify IPv4 address count on {} after recovery".format(interface))
+                    return False
+            if len(inet_lines) > 1:
+                if not expected_ip:
+                    print("Multiple IPv4 addresses detected on {} after restart".format(interface))
+                    return False
+                subprocess.run(
+                    ["ip", "-4", "addr", "flush", "dev", interface],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                )
+                add_proc = subprocess.run(
+                    ["ip", "-4", "addr", "add", expected_ip, "dev", interface],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                )
+                if add_proc.returncode != 0:
+                    print("Failed to recover IP address on {}: {}".format(interface, (add_proc.stderr or add_proc.stdout).strip()))
+                    return False
+                inet_lines = current_ipv4()
+                if len(inet_lines) != 1 or expected_ip not in inet_lines:
+                    print("Failed to verify IPv4 address count on {} after recovery".format(interface))
+                    return False
+            if expected_ip and expected_ip not in current_ipv4():
                 print("Failed to verify IP address on {} after restart".format(interface))
                 return False
+            if expected_dns:
+                current_dns = self._get_interface_expected_config(interface)[1]
+                if not set(expected_dns).issubset(set(current_dns)):
+                    print("Failed to verify DNS settings on {} after restart".format(interface))
+                    return False
+            return True
+        except Exception as exc:
+            print("Failed to restart networking! {}".format(exc))
+            return False
 
-        if expected_dns:
-            current_dns = self._get_interface_expected_config(interface)[1]
-            if not set(expected_dns).issubset(set(current_dns)):
-                print("Failed to verify DNS settings on {} after restart".format(interface))
-                return False
-
-        return True
-
-    # Restart network manager to make configuration active
-    @staticmethod
     def restart_network_manager(interface, address, netmask, new_gateway):
         try:
-            if not address == "":
-                cmd = "ifconfig {0} 0.0.0.0; ifconfig {1} {2} netmask {3}".format(interface, interface, address, netmask)
-                proc = subprocess.Popen(cmd, shell=True)
-                proc.wait()
-            elif not new_gateway == "":
-                cmd = "ip route del default"
-                proc = subprocess.Popen(cmd, shell=True)
-                proc.wait()
-                cmd = "ip route add default via {0}".format(new_gateway)
-                proc = subprocess.Popen(cmd, shell=True)
-                proc.wait()
-            cmd = "/etc/init.d/networking restart"
-            proc = subprocess.Popen(cmd, shell=True)
-            proc.wait()
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface or ""):
+                return False
+            if address:
+                address = str(ipaddress.IPv4Address(address))
+                netmask = str(ipaddress.IPv4Address(netmask))
+                first = subprocess.run(
+                    ["ifconfig", interface, "0.0.0.0"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                )
+                if first.returncode != 0:
+                    return False
+                second = subprocess.run(
+                    ["ifconfig", interface, address, "netmask", netmask],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                )
+                if second.returncode != 0:
+                    return False
+            elif new_gateway:
+                new_gateway = str(ipaddress.IPv4Address(new_gateway))
+                subprocess.run(["ip", "route", "del", "default"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                gateway_result = subprocess.run(
+                    ["ip", "route", "add", "default", "via", new_gateway],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                )
+                if gateway_result.returncode != 0:
+                    return False
+            restart = subprocess.run(
+                ["/etc/init.d/networking", "restart"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            return restart.returncode == 0
         except Exception:
             print("Failed to restart networking!")
             return False
-        return True
 
     def is_device_exist(self, interface):
         if not isinstance(interface, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface):
@@ -6556,17 +5561,11 @@ class AellaCli(cmd.Cmd, object):
             return False
 
     def system_is_container(self):
-        cmd = 'grep "docker\|kubepods" /proc/1/cgroup > /dev/null 2>&1'
-        status = subprocess.call(cmd, shell=True)
-        if status == 0:
-            return True
-        return False
-
-
-def signal_handler(signal, frame):
-    sys.stdout.write('^C')
-    sys.stdout.flush()
-
+        try:
+            cgroup = Path("/proc/1/cgroup").read_text(encoding="utf-8", errors="ignore")
+            return "docker" in cgroup or "kubepods" in cgroup
+        except OSError:
+            return False
 
 def bytes2human(n):
     """
