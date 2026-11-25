@@ -165,19 +165,20 @@ class InternalCommandSafetyTests(unittest.TestCase):
     def test_acl_comment_is_passed_as_one_literal_argv_value(self):
         args = self.cli._build_user_rule_args(
             "data1g", "192.0.2.10", "allow", "198.51.100.0/24",
-            "443", "test $(id); \`id\`",
+            "443", "test $(id); " + chr(96) + "id" + chr(96),
         )
         comment_index = args.index("--comment")
         comment = args[comment_index + 1]
         self.assertIn("$(id)", comment)
-        self.assertIn("\`id\`", comment)
+        self.assertIn(chr(96) + "id" + chr(96), comment)
         self.assertEqual(args[-1], comment)
 
     def test_acl_command_runner_does_not_expand_shell_metacharacters(self):
         with patch.object(module.subprocess, "run", return_value=Mock(returncode=0, stdout="", stderr="")) as run:
-            self.cli._run_cmd('sudo iptables -A TEST -m comment --comment "literal $(id); \`id\`" -j ACCEPT')
+            command = 'sudo iptables -A TEST -m comment --comment "literal $(id); ' + chr(96) + 'id' + chr(96) + '" -j ACCEPT'
+            self.cli._run_cmd(command)
         self.assertNotIn("shell", run.call_args.kwargs)
-        self.assertIn("literal $(id); \`id\`", run.call_args.args[0])
+        self.assertIn("literal $(id); " + chr(96) + "id" + chr(96), run.call_args.args[0])
 
     def test_acl_staging_uses_atomic_root_owned_state_not_tmp(self):
         source = inspect.getsource(module.AellaCli._save_acl_staging)
