@@ -1641,30 +1641,36 @@ class AellaCli(cmd.Cmd, object):
         return None
 
     def show_autostart_callback(self, key, param):
-        """Show VM auto start configuration"""
+        """Show VM auto start configuration."""
         vm_list = self.get_vm_list()
         if not vm_list:
-            print('\nNo VMs found.\n')
+            print("\nNo VMs found.\n")
             return
-
-        print('\nVM Auto Start Configuration:')
-        print('-' * 50)
+        print("\nVM Auto Start Configuration:")
+        print("-" * 50)
         for vm in sorted(vm_list):
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", vm):
+                print("  {:<20} unknown".format(vm))
+                continue
             try:
-                cmd = "virsh dominfo {} 2>/dev/null".format(vm)
-                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out, err = proc.communicate()
-                status = 'unknown'
-                if out:
-                    parsed = self._parse_virsh_autostart(out.decode('utf-8', errors='ignore'))
+                proc = subprocess.run(
+                    ["virsh", "dominfo", vm],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                status = "unknown"
+                if proc.returncode == 0:
+                    parsed = self._parse_virsh_autostart(proc.stdout)
                     if parsed is True:
-                        status = 'enabled'
+                        status = "enabled"
                     elif parsed is False:
-                        status = 'disabled'
-                print('  {:<20} {}'.format(vm, status))
+                        status = "disabled"
+                print("  {:<20} {}".format(vm, status))
             except Exception:
-                print('  {:<20} unknown'.format(vm))
-        print('')
+                print("  {:<20} unknown".format(vm))
+        print("")
 
     def show_interface_callback(self, key, param):
         if param and param[0].rstrip("?") == "mgt":
@@ -1770,69 +1776,49 @@ class AellaCli(cmd.Cmd, object):
             print(e)
 
     def show_cli_callback(self, key, param):
-        # default 30 last commands history
         last = 30
-
-        def is_valid_number(number):
-            if isinstance(number, int) and (number <= 1 or number <= 5000):
-                return True
-            else:
-                return False
-
-        if not param:
-            print('\nhistory    Show CLI history\n')
+        if not param or param[0].rstrip("?") != "history":
+            print("\nhistory    Show CLI history\n")
             return
-        elif len(param) <= 4:
-            if len(param) == 1 and re.match('^[?]$', param[0]):
-                print('\nhistory    Show CLI history\n')
+        if len(param) == 1 or (len(param) == 2 and param[1] == "?"):
+            pass
+        elif len(param) == 3 and param[1].rstrip("?") == "last":
+            try:
+                last = int(param[2])
+            except (TypeError, ValueError):
+                print("Invalid number: Enter a valid number from 1 to 5000\n")
                 return
-            elif len(param) == 1 and not re.match('history', param[0]): 
-                print('Invalid option: Available option is "history"')
-                print('\nhistory    Show CLI history\n')
+            if not 1 <= last <= 5000:
+                print("Invalid number: Enter a valid number from 1 to 5000\n")
                 return
-            elif (len(param) == 1 and re.match('history[?]', param[0])) or \
-                (len(param) == 2 and re.match('^[?]$', param[1])):
-                print('\nlast <number>    Show CLI history for last N (1..5000)')
-                print('Press [Enter]\n')
-                return
-            elif len(param) == 2 and re.match('history', param[0]) and not re.match('last', param[1]):
-                print('Invalid option: Available option is "last"')
-                print('\nlast <number>    Show CLI history for last N (1..5000)\n')
-                return
-            elif (len(param) == 2 and re.match('history', param[0]) and re.match('last[?]', param[1])) or \
-                (len(param) == 3 and re.match('history', param[0]) and re.match('^[?]$', param[2])):
-                print('\nlast <number>    Show CLI history for last N (1..5000)\n')
-                return
-            elif len(param) == 3 and re.match('history', param[0]) and re.match('last', param[1]) and re.match('^\d+[?]$', param[2]):
-                print('Press [Enter]\n')
-                return
-            elif len(param) == 3 and re.match('history', param[0]) and re.match('last', param[1]):
-                try:
-                    if is_valid_number(int(param[2])):
-                        last = param[2] 
-                    else:
-                        print("Invalid number: Enter a valid number from 1 to 5000\n")
-                        return
-                except ValueError:
-                    print("Invalid number: Enter a valid number from 1 to 5000\n")
-                    return
-            elif len(param) == 4 and re.match('history', param[0]) and re.match('last', param[1]) and re.match('^[?]$', param[3]):
-                print('Press [Enter]\n')
-                return
+        else:
+            print('\nUsage: show cli history [last <1..5000>]\n')
+            return
 
+        log_path = Path(LOG_DIR) / "aella_cli.log"
         try:
-            cmd = "tail -n {} /var/log/aella/aella_cli.log | awk -F'|' '/Run command/{{print $1, $5}}' | \
-                sed 's/,.*Run command:/ /' | sort -rn".format(last)
+            if os.geteuid() == 0:
+                content = _read_root_text_file(log_path)
+            else:
+                content = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            print("No CLI history is available.\n")
+            return
+        except Exception as exc:
+            print("Unable to read CLI history: {}\n".format(exc))
+            return
 
-            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-            res = p.communicate()
-            if res[0]:
-                for i in res:
-                    print(i.decode('utf-8').rstrip())
+        records = []
+        for line in content.splitlines()[-last:]:
+            fields = line.split("|", 4)
+            if len(fields) < 5 or "Run command:" not in fields[4]:
+                continue
+            timestamp = fields[0].split(",", 1)[0]
+            command_text = fields[4].split("Run command:", 1)[1].strip()
+            records.append((timestamp, command_text))
+        for timestamp, command_text in sorted(records, reverse=True):
+            print("{} {}".format(timestamp, command_text))
 
-        except Exception as e:
-            print(e)
-        
     # Set command
     @log_cmd
     def do_set(self, line):
@@ -4069,47 +4055,71 @@ class AellaCli(cmd.Cmd, object):
         return all(allowed.match(x) for x in hostname.split("."))
 
     def set_hostname_callback(self, key, param):
-        if not param or param[0].endswith('?') or len(param) < 1:
-            print('\n<String> \t Specify hostname string\n')
+        if not param or len(param) != 1 or param[0].endswith("?"):
+            print("\n<String> \t Specify hostname string\n")
             return
         hostname = param[0]
-        if len(hostname) > 64:
-            print('\nError: Hostname too long. Max length is 64.\n')
+        if len(hostname) > 64 or not self.is_valid_hostname(hostname):
+            print("\nError: Invalid hostname format.\n")
             return
-        if not self.is_valid_hostname(hostname):
-            print('\nError: Invalid hostname format.\n')
-            return
+
+        hosts_path = Path("/etc/hosts")
         try:
-            self.shell_cmd_exec('sudo sh -c \'sed -i "s/\<`hostname`\>/%s/g" /etc/hosts && hostname %s && echo %s > /etc/hostname\'' % (str(param[0]), str(param[0]), str(param[0])))
+            current = subprocess.run(
+                ["hostname"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            ).stdout.strip()
+            original = hosts_path.read_text(encoding="utf-8")
+            updated_lines = []
+            for line in original.splitlines(keepends=True):
+                body, marker, comment = line.partition("#")
+                if current:
+                    body = re.sub(
+                        r"(?<![A-Za-z0-9_.-]){}(?![A-Za-z0-9_.-])".format(re.escape(current)),
+                        hostname,
+                        body,
+                    )
+                updated_lines.append(body + marker + comment)
+            original_stat = os.stat(hosts_path)
+            _atomic_replace_text_file(str(hosts_path), "".join(updated_lines))
+            os.chown(str(hosts_path), original_stat.st_uid, original_stat.st_gid)
+            os.chmod(str(hosts_path), stat.S_IMODE(original_stat.st_mode))
+
+            result = subprocess.run(
+                ["hostnamectl", "set-hostname", hostname],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            )
+            if result.returncode != 0:
+                _atomic_replace_text_file(str(hosts_path), original)
+                os.chown(str(hosts_path), original_stat.st_uid, original_stat.st_gid)
+                os.chmod(str(hosts_path), stat.S_IMODE(original_stat.st_mode))
+                print("Failed to set hostname: {}".format(result.stderr.strip() or result.stdout.strip()))
+                return
             print("Successfully set hostname")
-        except:
-            print("Failed to set hostname")
+        except Exception as exc:
+            print("Failed to set hostname: {}".format(exc))
 
     @staticmethod
     def update_patch_history(patch_name, patch_history, log_file, success, msg):
         timestamp = str(datetime.datetime.now())
-        state = "Fail"
-        if success:
-            state = "Success"
-        patch_info = {"timestamp": timestamp,
-                      "state": state}
-        patch_history[patch_name] = patch_info
-        try:
-            with open(PATCH_HISTORY, 'w') as outfile:
-                json.dump(patch_history, outfile, sort_keys=True, indent=4, ensure_ascii=False)
-        except Exception as e:
-            print(e)
-        log_content = "Patch starts at {}\n".format(timestamp)
-        log_content += "{}\nPatch result: {}".format(msg, state)
-        try:
-            wf = open(log_file, 'w')
-            wf.write(str(log_content))
-            wf.close()
-        except Exception as e:
-            print(e)
+        state = "Success" if success else "Fail"
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", patch_name) or ".." in patch_name:
+            raise ValueError("Invalid patch name")
+        expected_log = Path(PATCH_LOG_DIR) / "{}.log".format(patch_name)
+        if Path(log_file) != expected_log:
+            raise ValueError("Patch log path is outside the protected patch directory")
+        patch_history[patch_name] = {"timestamp": timestamp, "state": state}
+        _ensure_patch_storage()
+        _write_root_text_file(
+            PATCH_HISTORY,
+            json.dumps(patch_history, sort_keys=True, indent=4, ensure_ascii=False),
+        )
+        log_content = "Patch starts at {}\n{}\nPatch result: {}".format(timestamp, msg, state)
+        _write_root_text_file(log_file, log_content)
 
     def set_patches_callback(self, key, param):
-        if not param or param[0].endswith('?'):
+        if not param or param[0].endswith("?"):
             print('\n<String> \t Specify patches string, use "set patch apply <patch_name>" to apply patch from StellarCyber\n')
             return
 
@@ -4123,26 +4133,30 @@ class AellaCli(cmd.Cmd, object):
                     print("Invalid patch name. Use a file name without directory components.")
                     return
 
+                _ensure_patch_storage()
                 log_file = os.path.join(PATCH_LOG_DIR, "{}.log".format(patch_name))
                 local_file = os.path.join(PATCH_DIR, patch_name)
                 try:
-                    with open(PATCH_HISTORY) as f:
-                        patch_history = json.load(f)
+                    patch_history = json.loads(_read_root_text_file(PATCH_HISTORY))
+                    if not isinstance(patch_history, dict):
+                        patch_history = {}
                 except Exception:
                     patch_history = {}
 
-                created, output = self.run_command_with_stderr(
-                    ["sudo", "mkdir", "-p", PATCH_DIR, PATCH_LOG_DIR]
-                )
-                if not created:
-                    message = output.decode("utf-8", errors="replace").strip() if isinstance(output, bytes) else str(output)
-                    print("Failed to prepare patch directory: {}".format(message))
-                    return
+                # Never let wget follow a pre-existing symlink or hard link.
+                if os.path.lexists(local_file):
+                    local_stat = os.lstat(local_file)
+                    if stat.S_ISDIR(local_stat.st_mode):
+                        print("Refusing unsafe patch target path.")
+                        return
+                    os.unlink(local_file)
 
                 url = "https://192.168.122.2:8443/hotfix/{}".format(patch_name)
-                download_cmd = ["wget", "--user={}".format(META_USER),
-                                "--password={}".format(META_TOKEN), "-O",
-                                local_file, "--no-check-certificate", url]
+                download_cmd = [
+                    "wget", "--user={}".format(META_USER),
+                    "--password={}".format(META_TOKEN), "-O",
+                    local_file, "--no-check-certificate", url,
+                ]
                 res, msg = self.run_command_with_stderr(download_cmd)
                 if not res:
                     message = msg.decode("utf-8", errors="replace").strip() if isinstance(msg, bytes) else str(msg)
@@ -4150,7 +4164,8 @@ class AellaCli(cmd.Cmd, object):
                     print(error_msg)
                     self.update_patch_history(patch_name, patch_history, log_file, False, error_msg)
                     return
-                success, msg = self.run_command_with_stderr(["sudo", "dpkg", "-i", local_file])
+
+                success, msg = self.run_command_with_stderr(["dpkg", "-i", local_file])
                 if success:
                     msg = "Success"
                 elif isinstance(msg, bytes):
@@ -4168,9 +4183,9 @@ class AellaCli(cmd.Cmd, object):
 
                 print("Applying updates...")
                 commands = [
-                    ["sudo", "apt", "-qq", "update"],
-                    ["sudo", "apt", "-qqy", "install", *package_specs],
-                    ["sudo", "apt", "clean"],
+                    ["apt", "-qq", "update"],
+                    ["apt", "-qqy", "install", *package_specs],
+                    ["apt", "clean"],
                 ]
                 for command in commands:
                     success, output = self.run_command_with_stderr(command)
@@ -4179,355 +4194,251 @@ class AellaCli(cmd.Cmd, object):
                         print("Failed to run {}: {}".format(command[1], message))
                         return
                 print("Successfully applied updates")
-        except Exception as e:
-            print("Failed to apply updates {}".format(e))
+        except Exception as exc:
+            print("Failed to apply updates {}".format(exc))
 
     def set_autostart_callback(self, key, param):
-        """Configure VM auto start"""
-        if not param or len(param) < 1:
-            print('\n<VM Name> [enable|disable]  Specify VM name and enable/disable auto start')
-            print('                             If enable/disable is omitted, it will toggle the current state\n')
+        """Configure VM auto start."""
+        if not param or len(param) > 2:
+            print("\n<VM Name> [enable|disable]  Specify VM name and enable/disable auto start\n")
             return
-
-        vm_name = param[0].rstrip('?')
-        if param[0].endswith('?') or vm_name == '?':
-            print('\n<VM Name> [enable|disable]  Specify VM name and enable/disable auto start')
-            print('                             If enable/disable is omitted, it will toggle the current state\n')
+        vm_name = param[0].rstrip("?")
+        if param[0].endswith("?") or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", vm_name):
+            print("Invalid VM name.")
             return
-
-        # Check if VM exists
         vm_list = self.get_vm_list()
         if vm_name not in vm_list:
-            print('VM "{}" not found. Available VMs: {}'.format(vm_name, ', '.join(vm_list) if vm_list else 'none'))
+            print('VM "{}" not found. Available VMs: {}'.format(vm_name, ", ".join(vm_list) if vm_list else "none"))
             return
 
-        # Get enable/disable option
         enable = None
-        if len(param) >= 2:
-            option = param[1].lower().rstrip('?')
-            if option == 'enable':
+        if len(param) == 2:
+            option = param[1].lower().rstrip("?")
+            if option == "enable":
                 enable = True
-            elif option == 'disable':
+            elif option == "disable":
                 enable = False
-            elif option == '?' or param[1].endswith('?'):
-                print('\n<VM Name> [enable|disable]  Specify VM name and enable/disable auto start')
-                print('                             If enable/disable is omitted, it will toggle the current state\n')
-                return
             else:
                 print('Invalid option: Available options are "enable" and "disable"')
-                print('\n<VM Name> [enable|disable]  Specify VM name and enable/disable auto start\n')
                 return
 
-        # If enable/disable not specified, check current state and toggle
-        if enable is None:
-            try:
-                cmd = "virsh dominfo {} 2>/dev/null".format(vm_name)
-                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out, err = proc.communicate()
-                if out:
-                    parsed = self._parse_virsh_autostart(out.decode('utf-8', errors='ignore'))
-                    if parsed is True:
-                        enable = False
-                    elif parsed is False:
-                        enable = True
-                    else:
-                        enable = True
-                else:
-                    enable = True
-            except Exception:
-                # If check fails, default to enable
-                enable = True
-
-        # Execute virsh autostart command
         try:
-            if enable:
-                cmd = "virsh autostart {}".format(vm_name)
-            else:
-                cmd = "virsh autostart --disable {}".format(vm_name)
-            result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if enable is None:
+                info = subprocess.run(
+                    ["virsh", "dominfo", vm_name],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, check=False,
+                )
+                parsed = self._parse_virsh_autostart(info.stdout) if info.returncode == 0 else None
+                enable = parsed is not True
+
+            command = ["virsh", "autostart"]
+            if not enable:
+                command.append("--disable")
+            command.append(vm_name)
+            result = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            )
             if result.returncode != 0:
-                err_msg = result.stderr.strip() if result.stderr else "Unknown error"
-                print("Failed to configure auto start for VM '{}': {}\n".format(vm_name, err_msg))
+                print("Failed to configure auto start for VM '{}': {}\n".format(
+                    vm_name, result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                ))
                 return
 
-            check_cmd = "virsh dominfo {} 2>/dev/null".format(vm_name)
-            check_proc = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, _ = check_proc.communicate()
-            status = 'unknown'
-            if out:
-                parsed = self._parse_virsh_autostart(out.decode('utf-8', errors='ignore'))
-                if parsed is True:
-                    status = 'enabled'
-                elif parsed is False:
-                    status = 'disabled'
+            check = subprocess.run(
+                ["virsh", "dominfo", vm_name],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            )
+            parsed = self._parse_virsh_autostart(check.stdout) if check.returncode == 0 else None
+            status = "enabled" if parsed is True else "disabled" if parsed is False else "unknown"
             print("VM '{}' auto start status: {}\n".format(vm_name, status))
-        except Exception as e:
-            print("Failed to configure auto start for VM '{}': {}\n".format(vm_name, e))
+        except Exception as exc:
+            print("Failed to configure auto start for VM '{}': {}\n".format(vm_name, exc))
 
     # clear commands
     def clear_cli_callback(self, key, param):
-        if len(param) <= 2:
-            if not param or (len(param) == 1 and re.match('^[?]$',param[0])):  
-                print('\nhistory    Clear CLI history\n')
-                return
-            elif (len(param) == 1 and not re.match('history', param[0])) or \
-                (len(param) == 2 and not re.match('history', param[0])):
-                print('Invalid option: Available option is "history"')
-                print('\nhistory    Clear CLI history\n')
-                return
-            elif (len(param) == 1 and re.match('history[?]', param[0])) or \
-                (len(param) == 2 and re.match('history', param[0]) and re.match('^[?]$', param[1])):
-                print('\nPress [Enter]\n')
-                return
+        if not param or param[0].rstrip("?") != "history" or len(param) != 1 or param[0].endswith("?"):
+            print("\nhistory    Clear CLI history\n")
+            return
         try:
-            current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            cli_log_file  = '/var/log/aella/aella_cli.log'
-            cli_log_backup = cli_log_file + '_' + current_time.replace(' ', '_').replace(':','')
+            log_dir = Path(LOG_DIR)
+            if os.geteuid() == 0:
+                gid = _ensure_root_owned_directory(str(log_dir), mode=0o750)
+            else:
+                gid = os.getgid()
+            log_path = log_dir / "aella_cli.log"
+            backup_stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            backup_path = log_dir / ("aella_cli.log_" + backup_stamp)
 
-            cmd = 'cp -a {0} {1}'.format(cli_log_file, cli_log_backup)
-            p = subprocess.call(cmd, shell=True)
-            if not p == 0:
-                print('Failed to copy: {}'.format(cmd))
-            log_str = '{},000|INFO|0|log|Run command: ### clear cli history ###\n'.format(current_time)
-            with open(cli_log_file, 'w') as f:
-                f.write(log_str) 
+            if os.path.lexists(log_path):
+                log_stat = os.lstat(log_path)
+                if stat.S_ISREG(log_stat.st_mode) and log_stat.st_nlink == 1:
+                    if os.path.lexists(backup_path):
+                        os.unlink(backup_path)
+                    shutil.copyfile(log_path, backup_path)
+                    if os.geteuid() == 0:
+                        os.chown(backup_path, 0, gid)
+                        os.chmod(backup_path, 0o640)
+                else:
+                    os.unlink(log_path)
 
-            # Backup up to 5 cli history files
-            cmd = 'ls -r /var/log/aella/aella_cli.log_*'
-            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-            res = p.communicate()
-            if res[0]:
-                backup_files = res[0].decode('utf-8').split()
-                old_backup_files = backup_files[5:]
-                if old_backup_files:
-                    for i in old_backup_files:
-                        os.system('rm {}'.format(i))
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_content = "{},000|INFO|0|log|Run command: ### clear cli history ###\n".format(timestamp)
+            _atomic_replace_text_file(str(log_path), log_content)
+            if os.geteuid() == 0:
+                os.chown(log_path, 0, gid)
+                os.chmod(log_path, 0o640)
 
-        except Exception as e:
-            print(e)
+            backups = []
+            for entry in log_dir.glob("aella_cli.log_*"):
+                if not re.fullmatch(r"aella_cli\.log_\d{4}-\d{2}-\d{2}_\d{6}", entry.name):
+                    continue
+                entry_stat = os.lstat(entry)
+                if stat.S_ISREG(entry_stat.st_mode) and entry_stat.st_nlink == 1:
+                    backups.append(entry)
+            backups.sort(key=lambda path: path.name, reverse=True)
+            for old_backup in backups[5:]:
+                old_backup.unlink()
+        except Exception as exc:
+            print("Failed to clear CLI history: {}".format(exc))
 
     def monitor_vm_callback(self, key, param):
-        """Monitor VM resource usage or launch htop for a specific VM"""
-        # Show help if explicitly requested
-        if param and len(param) == 1 and (param[0] == '?' or param[0] == 'help'):
-            print('\nhtop <VM Name>  Monitor specific VM with htop')
-            print('                List all running VMs with detailed resource usage\n')
+        """Monitor VM resource usage without invoking a shell."""
+        if param and len(param) == 1 and param[0] in {"?", "help"}:
+            print("\nhtop <VM Name>  Monitor a specific VM with htop")
+            print("                List running VMs with resource usage\n")
             return
-        
-        # Handle 'monitor vm htop <vm_name>'
-        if param and len(param) >= 1 and param[0] == 'htop':
-            if len(param) < 2:
-                print('\n<VM Name>  Specify VM name to monitor with htop\n')
+
+        if param and param[0] == "htop":
+            if len(param) != 2 or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", param[1]):
+                print("\n<VM Name>  Specify a valid VM name\n")
                 return
-            vm_name = param[1].rstrip('?')
-            if param[1].endswith('?') or vm_name == '?':
-                print('\n<VM Name>  Specify VM name to monitor with htop\n')
+            vm_name = param[1]
+            if vm_name not in self.get_vm_list():
+                print('VM "{}" not found.\n'.format(vm_name))
                 return
-            
-            # Find qemu PID for the VM
-            pid_file = '/run/libvirt/qemu/{}.pid'.format(vm_name)
-            if not os.path.exists(pid_file):
-                print('VM "{}" not found or not running (PID file does not exist)\n'.format(vm_name))
-                return
-            
+            pid_file = Path("/run/libvirt/qemu") / "{}.pid".format(vm_name)
             try:
-                with open(pid_file, 'r') as f:
-                    pid = f.read().strip()
-                # Execute htop in current TTY
-                subprocess.call(['sudo', 'htop', '-p', pid])
-            except Exception as e:
-                print('Failed to launch htop for VM "{}": {}\n'.format(vm_name, e))
+                pid_text = _read_root_text_file(pid_file).strip()
+                if not re.fullmatch(r"[1-9][0-9]{0,9}", pid_text):
+                    raise ValueError("Invalid VM PID file")
+                htop = shutil.which("htop", path="/usr/bin:/usr/sbin:/bin:/sbin")
+                if not htop:
+                    print("htop is not installed.\n")
+                    return
+                username = _get_invoking_username()
+                if not username:
+                    print("Unable to resolve the invoking account; monitor command denied.\n")
+                    return
+                argv = [htop, "-p", pid_text]
+                if username != "root":
+                    argv = ["/usr/bin/sudo", "-u", username, "--"] + argv
+                subprocess.call(argv, shell=False)
+            except Exception as exc:
+                print('Failed to launch htop for VM "{}": {}\n'.format(vm_name, exc))
             return
-        
-        # Handle 'monitor vm' - list VMs with detailed CPU/memory usage
+
         try:
-            # Get running VMs
-            cmd = "virsh list --name"
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, err = proc.communicate()
-            if proc.returncode != 0:
-                print('Failed to get VM list\n')
+            vm_result = subprocess.run(
+                ["virsh", "list", "--name"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            )
+            if vm_result.returncode != 0:
+                print("Failed to get VM list\n")
                 return
-            
-            vm_list = [vm.strip() for vm in out.decode('utf-8', errors='ignore').split('\n') if vm.strip()]
-            
+            vm_list = [name.strip() for name in vm_result.stdout.splitlines() if name.strip()]
             if not vm_list:
-                print('No running VMs found\n')
+                print("No running VMs found\n")
                 return
-            
-            # Get system CPU cores for reference
-            cmd = "nproc"
-            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, _ = proc.communicate()
-            total_cores = int(out.decode('utf-8', errors='ignore').strip()) if out else 1
-            
-            # Get total memory for reference
+
+            total_cores = os.cpu_count() or 1
+            mem_total_kb = 0
             try:
-                with open('/proc/meminfo', 'r') as f:
-                    meminfo = f.read()
-                    mem_total_kb = 0
-                    for line in meminfo.split('\n'):
-                        if line.startswith('MemTotal:'):
-                            mem_total_kb = int(line.split()[1])
-                            break
-                mem_total_gb = mem_total_kb / (1024.0 * 1024.0)
-            except Exception:
-                mem_total_gb = 0
-            
-            # Print header
-            print('\n' + '=' * 140)
-            print('VM Resource Usage Monitor')
-            print('=' * 140)
-            print('{:<15} {:<8} {:<12} {:<12} {:<12} {:<10} {:<12} {:<12} {:<12} {:<8} {:<8}'.format(
-                'VM', 'PID', 'CPU(top%)', 'CPU(host%)', 'CPU(vcpu%)', 'RSS(GB)', 'Mem(host%)', 'Mem(alloc%)', 'Alloc(GB)', 'vCPU', 'Status'))
-            print('-' * 140)
-            
-            # For each VM, get detailed resource usage
+                for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+                    if line.startswith("MemTotal:"):
+                        mem_total_kb = int(line.split()[1])
+                        break
+            except (OSError, ValueError, IndexError):
+                pass
+
+            print("\n" + "=" * 140)
+            print("VM Resource Usage Monitor")
+            print("=" * 140)
+            print("{:<15} {:<8} {:<12} {:<12} {:<12} {:<10} {:<12} {:<12} {:<12} {:<8} {:<8}".format(
+                "VM", "PID", "CPU(ps%)", "CPU(host%)", "CPU(vcpu%)", "RSS(GB)",
+                "Mem(host%)", "Mem(alloc%)", "Alloc(GB)", "vCPU", "Status"
+            ))
+            print("-" * 140)
+
             for vm in vm_list:
-                pid_file = '/run/libvirt/qemu/{}.pid'.format(vm)
-                if not os.path.exists(pid_file):
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", vm):
                     continue
-                
+                pid_file = Path("/run/libvirt/qemu") / "{}.pid".format(vm)
                 try:
-                    with open(pid_file, 'r') as f:
-                        pid = f.read().strip()
-                    
-                    # Get CPU, RSS, and threads using top (more accurate for multi-threaded processes)
-                    # Use top -b -n 1 for batch mode, single iteration
-                    cmd = "top -b -n 1 -p {} 2>/dev/null | tail -1".format(pid)
-                    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    out, err = proc.communicate()
-                    
-                    cpu_percent = 0.0
-                    rss_kb = 0
-                    threads = 0
-                    
-                    if proc.returncode == 0 and out:
-                        # Parse top output: PID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ COMMAND
-                        line = out.decode('utf-8', errors='ignore').strip()
-                        parts = line.split()
-                        if len(parts) >= 10:
-                            try:
-                                cpu_percent = float(parts[8])  # %CPU column
-                                # Get RSS from ps (top's RES is in KiB but we need exact value)
-                                cmd_ps = "ps -p {} -o rss,nlwp --no-headers".format(pid)
-                                proc_ps = subprocess.Popen(cmd_ps, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                                out_ps, _ = proc_ps.communicate()
-                                if proc_ps.returncode == 0 and out_ps:
-                                    ps_parts = out_ps.decode('utf-8', errors='ignore').strip().split()
-                                    if len(ps_parts) >= 2:
-                                        rss_kb = int(ps_parts[0].strip())
-                                        threads = int(ps_parts[1].strip())
-                            except (ValueError, IndexError):
-                                # Fallback to ps if top parsing fails
-                                cmd_ps = "ps -p {} -o %cpu,rss,nlwp --no-headers".format(pid)
-                                proc_ps = subprocess.Popen(cmd_ps, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                                out_ps, _ = proc_ps.communicate()
-                                if proc_ps.returncode == 0 and out_ps:
-                                    ps_parts = out_ps.decode('utf-8', errors='ignore').strip().split()
-                                    if len(ps_parts) >= 3:
-                                        cpu_percent = float(ps_parts[0].strip())
-                                        rss_kb = int(ps_parts[1].strip())
-                                        threads = int(ps_parts[2].strip())
-                    
-                    # If we still don't have data, try ps as fallback
-                    if rss_kb == 0:
-                        cmd_ps = "ps -p {} -o rss,nlwp --no-headers".format(pid)
-                        proc_ps = subprocess.Popen(cmd_ps, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        out_ps, _ = proc_ps.communicate()
-                        if proc_ps.returncode == 0 and out_ps:
-                            ps_parts = out_ps.decode('utf-8', errors='ignore').strip().split()
-                            if len(ps_parts) >= 2:
-                                rss_kb = int(ps_parts[0].strip())
-                                threads = int(ps_parts[1].strip())
-                    
-                    if rss_kb > 0:
-                        rss_mb = rss_kb / 1024.0
-                        rss_gb = rss_kb / 1024.0 / 1024.0
-                        
-                        # Get VM memory allocation from virsh (use "Memory" field which is current allocation, not "Max memory")
-                        try:
-                            # Try "Memory" first (current allocated memory)
-                            cmd = "virsh dominfo {} 2>/dev/null | grep -i '^Memory:' | awk '{{print $2}}'".format(vm)
-                            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                            out, _ = proc.communicate()
-                            if out:
-                                allocated_mem_kb = int(out.decode('utf-8', errors='ignore').strip())
-                                allocated_mem_mb = allocated_mem_kb / 1024.0
-                            else:
-                                # Fallback to "Max memory" if "Memory" not available
-                                cmd = "virsh dominfo {} 2>/dev/null | grep -i 'Max memory' | awk '{{print $3}}'".format(vm)
-                                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                                out, _ = proc.communicate()
-                                if out:
-                                    allocated_mem_kb = int(out.decode('utf-8', errors='ignore').strip())
-                                    allocated_mem_mb = allocated_mem_kb / 1024.0
-                                else:
-                                    allocated_mem_mb = 0
-                        except Exception:
-                            allocated_mem_mb = 0
-                        
-                        # Get CPU allocation (vCPUs)
-                        try:
-                            cmd = "virsh dominfo {} 2>/dev/null | grep -i 'CPU(s)' | awk '{{print $2}}'".format(vm)
-                            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                            out, _ = proc.communicate()
-                            if out:
-                                vcpus = int(out.decode('utf-8', errors='ignore').strip())
-                            else:
-                                vcpus = threads  # fallback to thread count
-                        except Exception:
-                            vcpus = threads
-                        
-                        # Calculate normalized values
-                        cpu_host_percent = cpu_percent / total_cores if total_cores > 0 else 0
-                        cpu_vcpu_percent = cpu_percent / vcpus if vcpus > 0 else 0
-                        mem_host_percent = (rss_kb / mem_total_kb) * 100 if mem_total_kb > 0 else 0
-                        alloc_gb = allocated_mem_mb / 1024.0 if allocated_mem_mb > 0 else 0
-                        mem_alloc_percent = (rss_mb / allocated_mem_mb) * 100 if allocated_mem_mb > 0 else 0
-                        
-                        # Determine status based on host thresholds
-                        status = 'OK'
-                        # CPU(host%): > 80 CRIT, > 50 WARN
-                        if cpu_host_percent > 80:
-                            status = 'CRIT'
-                        elif cpu_host_percent > 50:
-                            status = 'WARN'
-                        
-                        # Mem(host%): > 90 CRIT, > 75 WARN
-                        if mem_host_percent > 90:
-                            status = 'CRIT' if status != 'CRIT' else 'CRIT'
-                        elif mem_host_percent > 75:
-                            status = 'WARN' if status == 'OK' else status
-                        
-                        # Format output
-                        cpu_top_str = '{:.1f}'.format(cpu_percent)
-                        cpu_host_str = '{:.1f}'.format(cpu_host_percent)
-                        cpu_vcpu_str = '{:.1f}'.format(cpu_vcpu_percent)
-                        rss_gb_str = '{:.2f}'.format(rss_gb)
-                        mem_host_str = '{:.1f}'.format(mem_host_percent)
-                        mem_alloc_str = '{:.1f}'.format(mem_alloc_percent) if allocated_mem_mb > 0 else 'N/A'
-                        alloc_gb_str = '{:.2f}'.format(alloc_gb) if allocated_mem_mb > 0 else 'N/A'
-                        
-                        print('{:<15} {:<8} {:<12} {:<12} {:<12} {:<10} {:<12} {:<12} {:<12} {:<8} {:<8}'.format(
-                            vm, pid, cpu_top_str, cpu_host_str, cpu_vcpu_str, rss_gb_str, 
-                            mem_host_str, mem_alloc_str, alloc_gb_str, vcpus, status))
-                    else:
-                        # Skip VM if we can't get RSS
+                    pid = _read_root_text_file(pid_file).strip()
+                    if not re.fullmatch(r"[1-9][0-9]{0,9}", pid):
                         continue
-                except Exception as e:
-                    # Skip VM if we can't get its info
+                    ps_result = subprocess.run(
+                        ["ps", "-p", pid, "-o", "%cpu,rss,nlwp", "--no-headers"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, check=False,
+                    )
+                    ps_fields = ps_result.stdout.strip().split()
+                    if ps_result.returncode != 0 or len(ps_fields) < 3:
+                        continue
+                    cpu_percent = float(ps_fields[0])
+                    rss_kb = int(ps_fields[1])
+                    threads = int(ps_fields[2])
+                    if rss_kb <= 0:
+                        continue
+
+                    dominfo = subprocess.run(
+                        ["virsh", "dominfo", vm],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, check=False,
+                    ).stdout
+                    memory_match = re.search(r"^\s*Memory:\s*(\d+)", dominfo, re.MULTILINE)
+                    max_memory_match = re.search(r"^\s*Max memory:\s*(\d+)", dominfo, re.MULTILINE)
+                    cpu_match = re.search(r"^\s*CPU\(s\):\s*(\d+)", dominfo, re.MULTILINE)
+                    allocated_mem_kb = int(memory_match.group(1)) if memory_match else (
+                        int(max_memory_match.group(1)) if max_memory_match else 0
+                    )
+                    vcpus = int(cpu_match.group(1)) if cpu_match else threads
+
+                    rss_mb = rss_kb / 1024.0
+                    rss_gb = rss_kb / 1024.0 / 1024.0
+                    allocated_mem_mb = allocated_mem_kb / 1024.0 if allocated_mem_kb else 0
+                    cpu_host_percent = cpu_percent / total_cores if total_cores else 0
+                    cpu_vcpu_percent = cpu_percent / vcpus if vcpus else 0
+                    mem_host_percent = (rss_kb / mem_total_kb) * 100 if mem_total_kb else 0
+                    mem_alloc_percent = (rss_mb / allocated_mem_mb) * 100 if allocated_mem_mb else 0
+                    alloc_gb = allocated_mem_mb / 1024.0 if allocated_mem_mb else 0
+
+                    status = "CRIT" if cpu_host_percent > 80 or mem_host_percent > 90 else (
+                        "WARN" if cpu_host_percent > 50 or mem_host_percent > 75 else "OK"
+                    )
+                    print("{:<15} {:<8} {:<12} {:<12} {:<12} {:<10} {:<12} {:<12} {:<12} {:<8} {:<8}".format(
+                        vm, pid, "{:.1f}".format(cpu_percent), "{:.1f}".format(cpu_host_percent),
+                        "{:.1f}".format(cpu_vcpu_percent), "{:.2f}".format(rss_gb),
+                        "{:.1f}".format(mem_host_percent),
+                        "{:.1f}".format(mem_alloc_percent) if allocated_mem_mb else "N/A",
+                        "{:.2f}".format(alloc_gb) if allocated_mem_mb else "N/A",
+                        vcpus, status,
+                    ))
+                except (OSError, ValueError, IndexError):
                     continue
-            
-            print('-' * 140)
-            print('Legend:')
-            print('  CPU(host%): >50 WARN, >80 CRIT (CPU(top%) / {} cores)'.format(total_cores))
-            print('  Mem(host%): >75 WARN, >90 CRIT (RSS / host MemTotal)')
-            print('  CPU(vcpu%) / Mem(alloc%): Reference metrics only (not used for Status determination)')
-            print('  Use "monitor vm htop <VM Name>" for detailed process monitoring')
-            print('')
-        except Exception as e:
-            print('Failed to monitor VMs: {}\n'.format(e))
+
+            print("-" * 140)
+            print("Legend:")
+            print("  CPU(host%): >50 WARN, >80 CRIT (CPU(ps%) / {} cores)".format(total_cores))
+            print("  Mem(host%): >75 WARN, >90 CRIT (RSS / host MemTotal)")
+            print("  CPU(vcpu%) / Mem(alloc%): Reference metrics only")
+            print('  Use "monitor vm htop <VM Name>" for detailed process monitoring\n')
+        except Exception as exc:
+            print("Failed to monitor VMs: {}\n".format(exc))
 
     def monitor_system_callback(self, key, param):
         """Check system health status"""
@@ -4715,54 +4626,48 @@ class AellaCli(cmd.Cmd, object):
     @staticmethod
     def show_patch_history_callback(key, params):
         try:
-            # If a patch is specified, display the detail log of the path
-            patch = ""
-            if params:
-                patch = params[0]
+            _ensure_patch_storage()
             try:
-                with open(PATCH_HISTORY) as f:
-                    patch_history = json.load(f)
-            except Exception as e:
+                patch_history = json.loads(_read_root_text_file(PATCH_HISTORY))
+                if not isinstance(patch_history, dict):
+                    patch_history = {}
+            except Exception:
                 patch_history = {}
+
+            patch = params[0] if params else ""
             if patch:
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", patch) or ".." in patch:
+                    print("Invalid patch name.")
+                    return
                 if patch not in patch_history:
                     print("There is no history associated with the specified patch")
                     return
                 state = patch_history[patch].get("state", "Unknown")
-                log_file = "{}/{}.log".format(PATCH_LOG_DIR,
-                                              patch)
-                if not os.path.isfile(log_file):
+                log_file = Path(PATCH_LOG_DIR) / "{}.log".format(patch)
+                try:
+                    patch_log = _read_root_text_file(log_file)
+                except Exception:
                     print("There is no history associated with the specified patch")
                     return
-                try:
-                    rf = open(log_file, 'r')
-                    patch_log = rf.read()
-                    rf.close()
-                except:
-                    patch_log = ""
                 output = "Patch state: {}".format(state)
                 output += "\n=====================\n"
                 output += patch_log
-            # Only return summary
             else:
-                res = []
-                for patch_name in patch_history:
-                    patch_info = patch_history.get(patch_name, {})
-                    state = patch_info.get("state", "Unknown")
-                    timestamp = patch_info.get("timestamp", "Unknown")
-                    res.append("Patch name: {}".format(patch_name))
-                    res.append("State:      {}".format(state))
-                    res.append("Time:       {}".format(timestamp))
-                    res.append("====================")
-                if not res:
-                    output = "No patch history"
-                else:
-                    output = "\n".join(res)
+                records = []
+                for patch_name, patch_info in patch_history.items():
+                    if not isinstance(patch_name, str) or not isinstance(patch_info, dict):
+                        continue
+                    records.extend([
+                        "Patch name: {}".format(patch_name),
+                        "State:      {}".format(patch_info.get("state", "Unknown")),
+                        "Time:       {}".format(patch_info.get("timestamp", "Unknown")),
+                        "====================",
+                    ])
+                output = "\n".join(records) if records else "No patch history"
             print(output)
-        except Exception as e:
-            print("Failed to get patch history: {}".format(e))
+        except Exception as exc:
+            print("Failed to get patch history: {}".format(exc))
 
-    @staticmethod
     def _should_debug():
         return os.environ.get("AELLA_CLI_DEBUG") == "1"
 
@@ -6760,39 +6665,69 @@ class AellaCli(cmd.Cmd, object):
 
     # Check to see whether service port opened or not
     def service_is_running(self, service_port):
-        cmd = ('netstat -lnt | grep ":%d " | wc -l' % service_port)
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-        running = int(proc.stdout.read())
-        return running
+        try:
+            port = int(service_port)
+        except (TypeError, ValueError):
+            return 0
+        if not 1 <= port <= 65535:
+            return 0
+        proc = subprocess.run(
+            ["ss", "-lntH"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return 0
+        return sum(
+            1 for line in proc.stdout.splitlines()
+            if len(line.split()) >= 4 and line.split()[3].endswith(":{}".format(port))
+        )
 
     def run_command_with_stderr(self, cmd):
+        """Run an argv-only command. Shell command strings are intentionally rejected."""
+        if not isinstance(cmd, (list, tuple)) or not cmd or any(not isinstance(item, str) for item in cmd):
+            return False, "Only explicit argv command lists are supported."
         try:
-            if type(cmd) is list:
-                is_shell = False
-            else:
-                is_shell = True
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, shell=is_shell)
-            result = proc.communicate()
-            data = result[0]
-            error = result[1]
+            proc = subprocess.run(
+                list(cmd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
             if proc.returncode != 0:
-                return False, error
-            return True, data
-        except Exception as e:
-            return False, str(e)
+                return False, proc.stderr or proc.stdout
+            return True, proc.stdout
+        except Exception as exc:
+            return False, str(exc)
 
     # Execute shell command
     def shell_cmd_exec(self, line, crlf=True):
-        proc = subprocess.Popen(line, shell=True, stdout=subprocess.PIPE)
-        out, _ = proc.communicate()
-        if out:
-            output = out.strip().decode("utf-8")
+        """Execute an internal fixed command without invoking a shell."""
+        try:
+            argv = list(line) if isinstance(line, (list, tuple)) else shlex.split(line)
+        except (TypeError, ValueError) as exc:
+            print("Invalid internal command: {}".format(exc))
+            return False
+        if not argv or any(token in {";", "&&", "||", "|", ">", ">>", "<"} for token in argv):
+            print("Shell operators are not accepted by internal command execution.")
+            return False
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if proc.stdout:
+            output = proc.stdout.strip().decode("utf-8", errors="replace")
             if crlf:
-                print('\n{}\n'.format(output))
+                print("\n{}\n".format(output))
             else:
-                print('{}'.format(output))
+                print("{}".format(output))
         return proc.returncode == 0
+
+    def system_is_container(self):
+        try:
+            cgroup = Path("/proc/1/cgroup").read_text(encoding="utf-8", errors="ignore")
+            return "docker" in cgroup or "kubepods" in cgroup
+        except OSError:
+            return False
 
     def system_is_container(self):
         cmd = 'grep "docker\|kubepods" /proc/1/cgroup > /dev/null 2>&1'
